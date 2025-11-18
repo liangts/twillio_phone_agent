@@ -1,0 +1,16 @@
+{
+  "name": "twilio-phone-agent",
+  "version": "0.1.0",
+  "description": "Bridge Twilio phone calls to the OpenAI Realtime API",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.17.0"
+  }
+}
