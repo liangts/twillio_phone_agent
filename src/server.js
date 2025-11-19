@@ -50,6 +50,13 @@ if (!PUBLIC_HTTP_BASE) {
   console.warn('Warning: PUBLIC_URL is not set. Twilio will not be able to connect to your webhook or media stream without a publicly reachable URL.');
 }
 
+const RESPONSE_COMPLETION_EVENTS = new Set([
+  'response.completed',
+  'response.canceled',
+  'response.failed',
+  'response.error'
+]);
+
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -67,6 +74,10 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
+app.get('/voice', (_req, res) => {
+  res.type('text/plain').send('POST Twilio call webhooks to this endpoint to initiate a media stream.');
+});
+
 app.post('/voice', (req, res) => {
   const streamUrl = PUBLIC_WS_BASE ? `${PUBLIC_WS_BASE}/media` : null;
   if (!PUBLIC_HTTP_BASE || !streamUrl) {
@@ -77,7 +88,7 @@ app.post('/voice', (req, res) => {
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<Response>',
     '  <Connect>',
-    `    <Stream url="${streamUrl || ''}" track="inbound_track"/>`,
+    `    <Stream url="${streamUrl || ''}" track="both_tracks"/>`,
     '  </Connect>',
     '</Response>'
   ].join('\n');
@@ -224,6 +235,16 @@ function relayAudioToOpenAI(openAISocket, audioBase64) {
   openAISocket.send(JSON.stringify(message));
 }
 
+function requestOpenAIResponse(openAISocket, call) {
+  if (!openAISocket || openAISocket.readyState !== WebSocket.OPEN) return;
+  if (!call || call.awaitingResponse) return;
+
+  call.awaitingResponse = true;
+
+  openAISocket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+  openAISocket.send(JSON.stringify({ type: 'response.create' }));
+}
+
 function relayAudioToTwilio(twilioSocket, streamSid, audioBase64) {
   if (!twilioSocket || twilioSocket.readyState !== WebSocket.OPEN) return;
 
@@ -286,6 +307,13 @@ wss.on('connection', (twilioSocket) => {
           call.agentTranscript.push(Array.isArray(delta) ? delta.join(' ') : delta);
         }
       }
+
+      if (RESPONSE_COMPLETION_EVENTS.has(payload.type)) {
+        const call = activeCalls.get(streamSid);
+        if (call) {
+          call.awaitingResponse = false;
+        }
+      }
     },
     close: () => {
       console.log('OpenAI realtime WebSocket closed');
@@ -324,7 +352,8 @@ wss.on('connection', (twilioSocket) => {
         callerAudio: [],
         agentAudio: [],
         callerTranscript: [],
-        agentTranscript: []
+        agentTranscript: [],
+        awaitingResponse: false
       });
       openAISocket = createOpenAIClient(streamSid, {
         from: event.start?.from,
@@ -340,6 +369,9 @@ wss.on('connection', (twilioSocket) => {
         call.callerAudio.push(Buffer.from(event.media.payload, 'base64'));
       }
       relayAudioToOpenAI(openAISocket, event.media.payload);
+      if (call) {
+        requestOpenAIResponse(openAISocket, call);
+      }
       return;
     }
 
