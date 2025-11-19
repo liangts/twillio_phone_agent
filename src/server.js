@@ -253,68 +253,6 @@ wss.on('connection', (twilioSocket) => {
     }
   }
 
-  twilioSocket.on('message', (data) => {
-    let event;
-    try {
-      event = JSON.parse(data.toString());
-    } catch (err) {
-      console.error('Failed to parse Twilio media message', err);
-      return;
-    }
-
-    if (event.event === 'start') {
-      streamSid = event.start?.streamSid;
-      activeCalls.set(streamSid, {
-        streamSid,
-        from: event.start?.from,
-        to: event.start?.to,
-        callerAudio: [],
-        agentAudio: [],
-        callerTranscript: [],
-        agentTranscript: []
-      });
-      openAISocket = createOpenAIClient(streamSid, {
-        from: event.start?.from,
-        to: event.start?.to
-      });
-      return;
-    }
-
-    if (event.event === 'media' && event.media?.payload) {
-      const call = activeCalls.get(streamSid);
-      if (call) {
-        call.callerAudio.push(Buffer.from(event.media.payload, 'base64'));
-      }
-      relayAudioToOpenAI(openAISocket, event.media.payload);
-      return;
-    }
-
-    if (event.event === 'stop') {
-      console.log('Twilio stream stopped');
-      const call = activeCalls.get(streamSid);
-      if (call) {
-        emailCallSummary(call).finally(() => {
-          activeCalls.delete(streamSid);
-          teardown();
-        });
-      } else {
-        teardown();
-      }
-    }
-  });
-
-  twilioSocket.on('close', () => {
-    console.log('Twilio media WebSocket closed');
-    if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
-      openAISocket.close();
-    }
-  });
-
-  twilioSocket.on('error', (err) => {
-    console.error('Error from Twilio media WebSocket', err);
-    teardown();
-  });
-
   const openAIHandlers = {
     message: (raw) => {
       let payload;
@@ -361,14 +299,76 @@ wss.on('connection', (twilioSocket) => {
     }
   };
 
-  const bindOpenAIHandlers = () => {
-    if (!openAISocket) return;
-    openAISocket.on('message', openAIHandlers.message);
-    openAISocket.on('close', openAIHandlers.close);
-    openAISocket.on('error', openAIHandlers.error);
+  const bindOpenAIHandlers = (socket) => {
+    if (!socket) return;
+    socket.on('message', openAIHandlers.message);
+    socket.on('close', openAIHandlers.close);
+    socket.on('error', openAIHandlers.error);
   };
 
-  bindOpenAIHandlers();
+  twilioSocket.on('message', (data) => {
+    let event;
+    try {
+      event = JSON.parse(data.toString());
+    } catch (err) {
+      console.error('Failed to parse Twilio media message', err);
+      return;
+    }
+
+    if (event.event === 'start') {
+      streamSid = event.start?.streamSid;
+      activeCalls.set(streamSid, {
+        streamSid,
+        from: event.start?.from,
+        to: event.start?.to,
+        callerAudio: [],
+        agentAudio: [],
+        callerTranscript: [],
+        agentTranscript: []
+      });
+      openAISocket = createOpenAIClient(streamSid, {
+        from: event.start?.from,
+        to: event.start?.to
+      });
+      bindOpenAIHandlers(openAISocket);
+      return;
+    }
+
+    if (event.event === 'media' && event.media?.payload) {
+      const call = activeCalls.get(streamSid);
+      if (call) {
+        call.callerAudio.push(Buffer.from(event.media.payload, 'base64'));
+      }
+      relayAudioToOpenAI(openAISocket, event.media.payload);
+      return;
+    }
+
+    if (event.event === 'stop') {
+      console.log('Twilio stream stopped');
+      const call = activeCalls.get(streamSid);
+      if (call) {
+        emailCallSummary(call).finally(() => {
+          activeCalls.delete(streamSid);
+          teardown();
+        });
+      } else {
+        teardown();
+      }
+    }
+  });
+
+  twilioSocket.on('close', () => {
+    console.log('Twilio media WebSocket closed');
+    if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
+      openAISocket.close();
+    }
+  });
+
+  twilioSocket.on('error', (err) => {
+    console.error('Error from Twilio media WebSocket', err);
+    teardown();
+  });
+
 });
 
 process.on('SIGINT', () => {
