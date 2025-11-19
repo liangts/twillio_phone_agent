@@ -32,8 +32,8 @@ Optional email summary configuration (for call recordings + transcripts):
 ## Twilio configuration
 
 1. In the Twilio Console, set your phone number's **Voice & Fax / A CALL COMES IN** webhook to `https://<PUBLIC_URL>/voice` (include the `https://` prefix).
-2. The `/voice` endpoint responds with TwiML that instructs Twilio to start a bidirectional Media Stream to the same host at `wss://<PUBLIC_URL>/media`. You do **not** need to set a separate WebSocket env var—the server derives it from `PUBLIC_URL`. If you visit `GET /voice` locally (for example, with `curl http://localhost:3000/voice`) the server now returns a friendly reminder that the endpoint expects POST webhooks, which avoids the confusing `Cannot GET /voice` error.
-3. Twilio sends base64-encoded mulaw audio (8 kHz) into the stream and accepts outbound mulaw audio from the bridge.
+2. The `/voice` endpoint responds with TwiML that instructs Twilio to open a Media Stream to `wss://<PUBLIC_URL>/media`. You do **not** need to set a separate WebSocket env var—the server derives it from `PUBLIC_URL`. If you visit `GET /voice` locally (for example, with `curl http://localhost:3000/voice`) the server now returns a friendly reminder that the endpoint expects POST webhooks, which avoids the confusing `Cannot GET /voice` error.
+3. Twilio sends base64-encoded mulaw audio (8 kHz) into the stream and accepts outbound mulaw audio from the bridge. The `<Stream>` is declared with `track="inbound_track"` because Twilio only needs to deliver the caller's audio to the server—outbound audio is still permitted on the same WebSocket even though the track setting is inbound-only.
 
 ## OpenAI Realtime configuration
 

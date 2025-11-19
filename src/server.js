@@ -84,11 +84,13 @@ app.post('/voice', (req, res) => {
     console.error('PUBLIC_URL is missing or invalid. Twilio cannot be pointed to the media WebSocket.');
   }
 
+  // Twilio only needs to send the caller's audio to the bridge; outbound audio
+  // is still accepted even when the stream is declared as inbound-only.
   const twiml = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<Response>',
     '  <Connect>',
-    `    <Stream url="${streamUrl || ''}" track="both_tracks"/>`,
+    `    <Stream url="${streamUrl || ''}" track="inbound_track"/>`,
     '  </Connect>',
     '</Response>'
   ].join('\n');
