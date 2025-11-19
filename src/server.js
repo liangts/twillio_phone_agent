@@ -267,6 +267,17 @@ wss.on('connection', (twilioSocket) => {
   let streamSid;
   let openAISocket;
 
+  const cleanupActiveCall = ({ summarize = false } = {}) => {
+    if (!streamSid) return Promise.resolve();
+    const call = activeCalls.get(streamSid);
+    if (!call) return Promise.resolve();
+    activeCalls.delete(streamSid);
+    if (summarize) {
+      return emailCallSummary(call);
+    }
+    return Promise.resolve();
+  };
+
   function teardown() {
     if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
       openAISocket.close();
@@ -319,13 +330,17 @@ wss.on('connection', (twilioSocket) => {
     },
     close: () => {
       console.log('OpenAI realtime WebSocket closed');
-      if (twilioSocket.readyState === WebSocket.OPEN) {
-        twilioSocket.close();
-      }
+      cleanupActiveCall().finally(() => {
+        if (twilioSocket.readyState === WebSocket.OPEN) {
+          twilioSocket.close();
+        }
+      });
     },
     error: (err) => {
       console.error('Error from OpenAI realtime WebSocket', err);
-      teardown();
+      cleanupActiveCall().finally(() => {
+        teardown();
+      });
     }
   };
 
@@ -379,28 +394,28 @@ wss.on('connection', (twilioSocket) => {
 
     if (event.event === 'stop') {
       console.log('Twilio stream stopped');
-      const call = activeCalls.get(streamSid);
-      if (call) {
-        emailCallSummary(call).finally(() => {
-          activeCalls.delete(streamSid);
+      cleanupActiveCall({ summarize: true })
+        .catch((err) => console.error('Failed to process call summary', err))
+        .finally(() => {
           teardown();
         });
-      } else {
-        teardown();
       }
-    }
   });
 
   twilioSocket.on('close', () => {
     console.log('Twilio media WebSocket closed');
-    if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
-      openAISocket.close();
-    }
+    cleanupActiveCall().finally(() => {
+      if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
+        openAISocket.close();
+      }
+    });
   });
 
   twilioSocket.on('error', (err) => {
     console.error('Error from Twilio media WebSocket', err);
-    teardown();
+    cleanupActiveCall().finally(() => {
+      teardown();
+    });
   });
 
 });
