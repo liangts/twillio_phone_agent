@@ -413,12 +413,12 @@ function processAgentTranscriptEvent(call, payload) {
   const type = payload?.type;
   if (!type) return false;
 
-  if (type === 'response.audio_transcript.delta') {
+  if (type === 'response.output_audio_transcript.delta') {
     call.currentAgentText = appendTranscriptBuffer(call.currentAgentText, payload.delta || payload.text);
     return true;
   }
 
-  if (type === 'response.audio_transcript.done') {
+  if (type === 'response.output_audio_transcript.done') {
     const transcript = payload.transcript || call.currentAgentText;
     recordTranscriptLine(call, 'Agent', transcript);
     call.currentAgentText = '';
