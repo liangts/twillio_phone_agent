@@ -2,422 +2,469 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const dotenv = require('dotenv');
-const nodemailer = require('nodemailer');
 const WebSocket = require('ws');
+const OpenAI = require('openai');
+const Twilio = require('twilio');
 
 dotenv.config();
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-realtime';
-const PUBLIC_URL = process.env.PUBLIC_URL;
+const OPENAI_WEBHOOK_SECRET = process.env.OPENAI_WEBHOOK_SECRET;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-realtime';
+const OPENAI_VOICE = process.env.OPENAI_VOICE || 'alloy';
 const PROMPT_PATH = process.env.PROMPT_PATH || path.join(__dirname, '..', 'config', 'agent_prompt.md');
-const SMTP_HOST = process.env.SMTP_HOST;
-const SMTP_PORT = process.env.SMTP_PORT;
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
-const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
-const EMAIL_FROM = process.env.EMAIL_FROM;
-const EMAIL_TO = process.env.EMAIL_TO;
+const WELCOME_MESSAGE = process.env.WELCOME_MESSAGE || 'Thanks for calling. How can I help you today?';
+const WS_CONNECT_DELAY_MS = Number(process.env.WS_CONNECT_DELAY_MS || 250);
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const HUMAN_AGENT_NUMBER = process.env.HUMAN_AGENT_NUMBER;
+const TWILIO_HUMAN_LABEL = process.env.TWILIO_HUMAN_LABEL || 'human agent';
 
 if (!OPENAI_API_KEY) {
-  console.warn('Warning: OPENAI_API_KEY is not set. The bridge will not connect to OpenAI until it is configured.');
+  console.error('Missing OPENAI_API_KEY. Cannot accept calls without an API key.');
+  process.exit(1);
 }
 
-function normalizeBaseUrl(url) {
-  if (!url) return null;
-  return url.replace(/\/$/, '');
+if (!OPENAI_WEBHOOK_SECRET) {
+  console.error('Missing OPENAI_WEBHOOK_SECRET. Set it to the secret configured in the OpenAI SIP Connector webhook.');
+  process.exit(1);
 }
 
-function httpToWs(url) {
-  if (!url) return null;
-  if (url.startsWith('ws://') || url.startsWith('wss://')) {
-    return url;
-  }
-  if (url.startsWith('https://')) {
-    return `wss://${url.slice('https://'.length)}`;
-  }
-  if (url.startsWith('http://')) {
-    return `ws://${url.slice('http://'.length)}`;
-  }
-  return `wss://${url}`;
-}
-
-const PUBLIC_HTTP_BASE = normalizeBaseUrl(PUBLIC_URL);
-const PUBLIC_WS_BASE = httpToWs(PUBLIC_HTTP_BASE);
-
-if (!PUBLIC_HTTP_BASE) {
-  console.warn('Warning: PUBLIC_URL is not set. Twilio will not be able to connect to your webhook or media stream without a publicly reachable URL.');
-}
-
-const RESPONSE_COMPLETION_EVENTS = new Set([
-  'response.completed',
-  'response.canceled',
-  'response.failed',
-  'response.error'
-]);
-
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+
+const activeCalls = new Map();
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+const toolHandlers = new Map();
+
+if (twilioClient && HUMAN_AGENT_NUMBER) {
+  toolHandlers.set('transfer_to_human', {
+    description: 'Invite a live human agent into the current call via Twilio Programmable SIP.',
+    parameters: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          description: 'Optional context for why the caller is being transferred.'
+        }
+      }
+    },
+    handler: async (call, args = {}) => {
+      const conferenceName = call.conferenceName || args.conferenceName;
+      const callToken = call.callToken || args.callToken;
+      const callerNumber = call.from || args.from;
+
+      if (!conferenceName || !callToken || !callerNumber) {
+        const missing = [];
+        if (!conferenceName) missing.push('conferenceName');
+        if (!callToken) missing.push('callToken');
+        if (!callerNumber) missing.push('callerNumber');
+        console.error(
+          `transfer_to_human requested but missing metadata: ${missing.join(', ')}`
+        );
+        return {
+          status: 'error',
+          message: 'I tried to add a teammate but could not find the call metadata.'
+        };
+      }
+
+      try {
+        await twilioClient
+          .conferences(conferenceName)
+          .participants.create({
+            from: callerNumber,
+            label: TWILIO_HUMAN_LABEL,
+            to: HUMAN_AGENT_NUMBER,
+            earlyMedia: false,
+            callToken
+          });
+        console.log(`Invited human agent into conference ${conferenceName}`);
+        return {
+          status: 'ok',
+          message:
+            args?.confirmationMessage ||
+            'Bringing a teammate into the call now. Thanks for waiting!'
+        };
+      } catch (err) {
+        console.error('Failed to add human agent via Twilio', err);
+        return {
+          status: 'error',
+          message: 'I could not reach a human agent right now.'
+        };
+      }
+    }
+  });
+} else {
+  console.log(
+    'Twilio warm transfer is disabled (missing TWILIO credentials or HUMAN_AGENT_NUMBER).'
+  );
+}
+
+function getToolDefinitions() {
+  if (!toolHandlers.size) {
+    return undefined;
+  }
+
+  return Array.from(toolHandlers.entries()).map(([name, descriptor]) => ({
+    type: 'function',
+    name,
+    description: descriptor.description,
+    parameters: descriptor.parameters || { type: 'object', properties: {} }
+  }));
+}
 
 function loadPrompt() {
   try {
     return fs.readFileSync(PROMPT_PATH, 'utf8');
   } catch (err) {
-    console.warn(`Prompt file not found at ${PROMPT_PATH}. Using a default system message.`);
-    return 'You are a helpful phone agent.';
+    console.warn(`Prompt file not found at ${PROMPT_PATH}. Using default instructions.`);
+    return 'You are a helpful realtime phone agent.';
   }
+}
+
+function buildCallAcceptPayload(callEvent) {
+  const instructions = loadPrompt();
+  const from = callEvent?.data?.from?.number || callEvent?.data?.from || 'unknown';
+  const to = callEvent?.data?.to?.number || callEvent?.data?.to || 'unknown';
+  const tools = getToolDefinitions();
+
+  return {
+    type: 'realtime',
+    model: OPENAI_MODEL,
+    instructions,
+    audio: {
+      output: {
+        voice: OPENAI_VOICE
+      }
+    },
+    metadata: {
+      from,
+      to
+    },
+    ...(tools ? { tools } : {})
+  };
+}
+
+function resolveWsUrl(callEvent, callId) {
+  return (
+    callEvent?.data?.wss_url ||
+    callEvent?.data?.sip_wss_url ||
+    callEvent?.data?.websocket_url ||
+    `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(callId)}`
+  );
+}
+
+function createCallState(callId, callEvent) {
+  const from = callEvent?.data?.from?.number || callEvent?.data?.from || 'unknown';
+  const to = callEvent?.data?.to?.number || callEvent?.data?.to || 'unknown';
+  const callToken =
+    callEvent?.data?.call_token ||
+    callEvent?.data?.twilio?.call_token ||
+    callEvent?.data?.metadata?.call_token ||
+    null;
+  const conferenceName = extractConferenceName(callEvent);
+
+  return {
+    callId,
+    from,
+    to,
+    callToken,
+    conferenceName,
+    ws: null,
+    transcripts: {
+      caller: [],
+      agent: []
+    },
+    createdAt: Date.now(),
+    pendingToolCalls: new Map()
+  };
+}
+
+function extractConferenceName(callEvent) {
+  const sipHeaders = callEvent?.data?.sip_headers;
+  if (Array.isArray(sipHeaders)) {
+    const header = sipHeaders.find((h) => {
+      const name = (h.name || '').toLowerCase();
+      return name === 'x-conferencename' || name === 'x-conference-name';
+    });
+    if (header?.value) {
+      return header.value;
+    }
+  }
+  return callEvent?.data?.metadata?.conference || null;
+}
+
+function closeActiveCall(callId, reason = 'unknown') {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  if (call.ws && call.ws.readyState === WebSocket.OPEN) {
+    call.ws.close();
+  }
+  activeCalls.delete(callId);
+  console.log(`Cleaned up call ${callId} (${reason})`);
+}
+
+function sendSystemResponse(call, instructions) {
+  if (!instructions || !call.ws || call.ws.readyState !== WebSocket.OPEN) return;
+  call.ws.send(
+    JSON.stringify({
+      type: 'response.create',
+      response: {
+        instructions
+      }
+    })
+  );
+}
+
+function handleToolCallDelta(call, delta) {
+  if (!toolHandlers.size) return;
+  if (!delta) return;
+  const toolCallId = delta.tool_call_id || delta.id;
+  if (!toolCallId) return;
+
+  const entry =
+    call.pendingToolCalls.get(toolCallId) || {
+      id: toolCallId,
+      name: delta.name,
+      arguments: ''
+    };
+
+  if (delta.name) {
+    entry.name = delta.name;
+  }
+
+  if (typeof delta.arguments === 'string') {
+    entry.arguments = (entry.arguments || '') + delta.arguments;
+  } else if (delta.arguments && typeof delta.arguments === 'object') {
+    entry.arguments = JSON.stringify(delta.arguments);
+  }
+
+  if (typeof delta.completed === 'boolean') {
+    entry.completed = delta.completed;
+  }
+
+  call.pendingToolCalls.set(toolCallId, entry);
+
+  const done =
+    delta.status === 'completed' ||
+    delta.completed === true ||
+    delta.is_final === true ||
+    delta.done === true;
+
+  if (done) {
+    finalizeToolCall(call, toolCallId);
+  }
+}
+
+function handleToolCallDone(call, payload) {
+  if (!toolHandlers.size) return;
+  const toolCallId = payload?.tool_call_id || payload?.id;
+  if (!toolCallId) return;
+  finalizeToolCall(call, toolCallId);
+}
+
+function finalizeToolCall(call, toolCallId) {
+  const toolCall = call.pendingToolCalls.get(toolCallId);
+  if (!toolCall) return;
+  call.pendingToolCalls.delete(toolCallId);
+
+  executeToolCall(call, toolCall).catch((err) => {
+    console.error(`Tool ${toolCall.name} failed`, err);
+    sendSystemResponse(call, 'I could not complete that action. Let me keep helping in the meantime.');
+  });
+}
+
+async function executeToolCall(call, toolCall) {
+  const handlerEntry = toolHandlers.get(toolCall.name);
+  if (!handlerEntry) {
+    console.warn(`No handler registered for tool ${toolCall.name}`);
+    return;
+  }
+
+  let args = {};
+  if (toolCall.arguments) {
+    try {
+      args = JSON.parse(toolCall.arguments);
+    } catch (err) {
+      console.warn('Failed to parse tool arguments, passing raw string.');
+      args = { raw: toolCall.arguments };
+    }
+  }
+
+  const result = await handlerEntry.handler(call, args);
+  if (result?.message) {
+    sendSystemResponse(call, result.message);
+  }
+}
+
+function handleRealtimeMessage(call, raw) {
+  let payload;
+  try {
+    payload = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
+  } catch (err) {
+    console.error('Failed to parse realtime event', err);
+    return;
+  }
+
+  switch (payload.type) {
+    case 'response.output_text.delta':
+      if (payload.delta) {
+        call.transcripts.agent.push(Array.isArray(payload.delta) ? payload.delta.join(' ') : payload.delta);
+      }
+      break;
+    case 'response.output_audio.delta':
+      // Nothing to relay back—OpenAI streams audio directly to the caller via SIP.
+      break;
+    default:
+      if (payload.type?.includes('input_text')) {
+        const delta = payload.delta || payload.text || payload.input_text;
+        if (delta) {
+          call.transcripts.caller.push(Array.isArray(delta) ? delta.join(' ') : delta);
+        }
+      }
+      break;
+  }
+
+  if (payload.type === 'response.output_tool_call.delta') {
+    handleToolCallDelta(call, payload.delta || payload);
+  }
+
+  if (payload.type === 'response.output_tool_call.done') {
+    handleToolCallDone(call, payload);
+  }
+
+  if (payload.type === 'response.completed') {
+    console.log(`Call ${call.callId}: response completed.`);
+  }
+}
+
+function connectRealtimeSocket(call, wsUrl) {
+  const url = wsUrl || `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(call.callId)}`;
+  const delay = Math.max(0, WS_CONNECT_DELAY_MS);
+
+  setTimeout(() => {
+    const ws = new WebSocket(url, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Origin: 'https://api.openai.com'
+      }
+    });
+
+    call.ws = ws;
+
+    ws.on('open', () => {
+      console.log(`Realtime socket open for call ${call.callId}`);
+      if (WELCOME_MESSAGE) {
+        const message = {
+          type: 'response.create',
+          response: {
+            instructions: WELCOME_MESSAGE
+          }
+        };
+        ws.send(JSON.stringify(message));
+      }
+    });
+
+    ws.on('message', (data) => handleRealtimeMessage(call, data));
+
+    ws.on('close', (code, reason) => {
+      console.log(`Realtime socket closed for ${call.callId}`, code, reason?.toString?.());
+      activeCalls.delete(call.callId);
+    });
+
+    ws.on('error', (err) => {
+      console.error(`Realtime socket error for ${call.callId}`, err);
+      closeActiveCall(call.callId, 'socket_error');
+    });
+  }, delay);
+}
+
+async function acceptIncomingCall(callEvent) {
+  const callId = callEvent?.data?.call_id;
+  if (!callId) {
+    throw new Error('Incoming call event missing call_id');
+  }
+
+  const callState = createCallState(callId, callEvent);
+  activeCalls.set(callId, callState);
+
+  const acceptPayload = buildCallAcceptPayload(callEvent);
+  const resp = await fetch(
+    `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(acceptPayload)
+    }
+  );
+
+  if (!resp.ok) {
+    activeCalls.delete(callId);
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Failed to accept call ${callId}: ${resp.status} ${resp.statusText} ${text}`);
+  }
+
+  const wsUrl = resolveWsUrl(callEvent, callId);
+  connectRealtimeSocket(callState, wsUrl);
 }
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.get('/voice', (_req, res) => {
-  res.type('text/plain').send('POST Twilio call webhooks to this endpoint to initiate a media stream.');
-});
+app.post(
+  '/openai/webhook',
+  express.raw({ type: '*/*' }),
+  async (req, res) => {
+    const rawBody = req.body;
+    try {
+      const event = await openai.webhooks.unwrap(
+        rawBody.toString('utf8'),
+        req.headers,
+        OPENAI_WEBHOOK_SECRET
+      );
 
-app.post('/voice', (req, res) => {
-  const streamUrl = PUBLIC_WS_BASE ? `${PUBLIC_WS_BASE}/media` : null;
-  if (!PUBLIC_HTTP_BASE || !streamUrl) {
-    console.error('PUBLIC_URL is missing or invalid. Twilio cannot be pointed to the media WebSocket.');
+      if (!event?.type) {
+        return res.sendStatus(200);
+      }
+
+      switch (event.type) {
+        case 'realtime.call.incoming':
+          await acceptIncomingCall(event);
+          res.set('Authorization', `Bearer ${OPENAI_API_KEY}`);
+          return res.sendStatus(200);
+        case 'realtime.call.ended':
+        case 'realtime.call.disconnected':
+          closeActiveCall(event?.data?.call_id || event?.data?.id || 'unknown', event.type);
+          return res.sendStatus(200);
+        default:
+          console.log(`Received ${event.type}`);
+          return res.sendStatus(200);
+      }
+    } catch (err) {
+      const message = err?.message || '';
+      if (
+        err?.name === 'InvalidWebhookSignatureError' ||
+        message.toLowerCase().includes('invalid signature')
+      ) {
+        return res.status(400).send('Invalid signature');
+      }
+      console.error('Error handling webhook', err);
+      return res.status(500).send('Server error');
+    }
   }
-
-  // Twilio only needs to send the caller's audio to the bridge; outbound audio
-  // is still accepted even when the stream is declared as inbound-only.
-  const twiml = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    '<Response>',
-    '  <Connect>',
-    `    <Stream url="${streamUrl || ''}" track="inbound_track"/>`,
-    '  </Connect>',
-    '</Response>'
-  ].join('\n');
-
-  res.type('text/xml').send(twiml);
-});
+);
 
 const server = app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
-});
-
-const wss = new WebSocket.Server({ server, path: '/media' });
-
-const activeCalls = new Map();
-
-function createMulawWavBuffer(dataBuffers) {
-  const data = Buffer.concat(dataBuffers);
-  const header = Buffer.alloc(44);
-  const dataSize = data.length;
-
-  header.write('RIFF', 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write('WAVE', 8);
-  header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16); // PCM header size
-  header.writeUInt16LE(7, 20); // mu-law format code
-  header.writeUInt16LE(1, 22); // channels
-  header.writeUInt32LE(8000, 24); // sample rate
-  header.writeUInt32LE(8000, 28); // byte rate
-  header.writeUInt16LE(1, 32); // block align
-  header.writeUInt16LE(8, 34); // bits per sample
-  header.write('data', 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  return Buffer.concat([header, data]);
-}
-
-function createMailTransport() {
-  if (!SMTP_HOST || !EMAIL_FROM || !EMAIL_TO) {
-    console.warn('Email is not configured. Set SMTP_HOST, EMAIL_FROM, and EMAIL_TO to enable summaries.');
-    return null;
-  }
-
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT) || 587,
-    secure: SMTP_SECURE,
-    auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined
-  });
-}
-
-async function emailCallSummary(call) {
-  const transport = createMailTransport();
-  if (!transport) return;
-
-  const callerTranscript = call.callerTranscript.join('').trim();
-  const agentTranscript = call.agentTranscript.join('').trim();
-
-  const attachments = [];
-  if (call.callerAudio.length) {
-    attachments.push({
-      filename: `caller-${call.streamSid}.wav`,
-      content: createMulawWavBuffer(call.callerAudio)
-    });
-  }
-  if (call.agentAudio.length) {
-    attachments.push({
-      filename: `agent-${call.streamSid}.wav`,
-      content: createMulawWavBuffer(call.agentAudio)
-    });
-  }
-
-  const subject = `Call summary for ${call.streamSid}`;
-  const text = [
-    `From: ${call.from || 'unknown'}`,
-    `To: ${call.to || 'unknown'}`,
-    '',
-    'Caller transcript:',
-    callerTranscript || '(none)',
-    '',
-    'Agent transcript:',
-    agentTranscript || '(none)'
-  ].join('\n');
-
-  try {
-    await transport.sendMail({
-      from: EMAIL_FROM,
-      to: EMAIL_TO,
-      subject,
-      text,
-      attachments
-    });
-    console.log(`Sent call summary email for ${call.streamSid}`);
-  } catch (err) {
-    console.error('Failed to send call summary email', err);
-  }
-}
-
-function createOpenAIClient(streamSid, callInfo = {}) {
-  if (!OPENAI_API_KEY) return null;
-
-  const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
-  const headers = {
-    Authorization: `Bearer ${OPENAI_API_KEY}`,
-    'OpenAI-Beta': 'realtime=v1'
-  };
-
-  const socket = new WebSocket(url, { headers });
-  const prompt = loadPrompt();
-
-  socket.on('open', () => {
-    const sessionUpdate = {
-      type: 'session.update',
-      session: {
-        instructions: prompt,
-        input_audio_format: 'pcm_mulaw',
-        input_sampling_rate: 8000,
-        output_audio_format: 'pcm_mulaw',
-        output_sampling_rate: 8000,
-        modalities: ['text', 'audio'],
-        turn_detection: { type: 'server_vad' },
-        metadata: {
-          streamSid,
-          from: callInfo.from,
-          to: callInfo.to
-        }
-      }
-    };
-
-    socket.send(JSON.stringify(sessionUpdate));
-  });
-
-  return socket;
-}
-
-function relayAudioToOpenAI(openAISocket, audioBase64) {
-  if (!openAISocket || openAISocket.readyState !== WebSocket.OPEN) return;
-
-  const message = {
-    type: 'input_audio_buffer.append',
-    audio: audioBase64
-  };
-
-  openAISocket.send(JSON.stringify(message));
-}
-
-function requestOpenAIResponse(openAISocket, call) {
-  if (!openAISocket || openAISocket.readyState !== WebSocket.OPEN) return;
-  if (!call || call.awaitingResponse) return;
-
-  call.awaitingResponse = true;
-
-  openAISocket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-  openAISocket.send(JSON.stringify({ type: 'response.create' }));
-}
-
-function relayAudioToTwilio(twilioSocket, streamSid, audioBase64) {
-  if (!twilioSocket || twilioSocket.readyState !== WebSocket.OPEN) return;
-
-  const message = {
-    event: 'media',
-    streamSid,
-    media: {
-      payload: audioBase64,
-      track: 'outbound'
-    }
-  };
-
-  twilioSocket.send(JSON.stringify(message));
-}
-
-wss.on('connection', (twilioSocket) => {
-  console.log('Twilio media stream connected');
-  let streamSid;
-  let openAISocket;
-
-  const cleanupActiveCall = ({ summarize = false } = {}) => {
-    if (!streamSid) return Promise.resolve();
-    const call = activeCalls.get(streamSid);
-    if (!call) return Promise.resolve();
-    activeCalls.delete(streamSid);
-    if (summarize) {
-      return emailCallSummary(call);
-    }
-    return Promise.resolve();
-  };
-
-  function teardown() {
-    if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
-      openAISocket.close();
-    }
-    if (twilioSocket.readyState === WebSocket.OPEN) {
-      twilioSocket.close();
-    }
-  }
-
-  const openAIHandlers = {
-    message: (raw) => {
-      let payload;
-      try {
-        payload = JSON.parse(raw.toString());
-      } catch (err) {
-        console.error('Failed to parse OpenAI message', err);
-        return;
-      }
-
-      if (payload.type === 'response.output_audio.delta' && payload.delta) {
-        const call = activeCalls.get(streamSid);
-        if (call) {
-          call.agentAudio.push(Buffer.from(payload.delta, 'base64'));
-        }
-        relayAudioToTwilio(twilioSocket, streamSid, payload.delta);
-      }
-
-      if (payload.type?.includes('input_text')) {
-        const call = activeCalls.get(streamSid);
-        const delta = payload.delta || payload.text || payload.input_text;
-        if (call && delta) {
-          call.callerTranscript.push(delta);
-        }
-      }
-
-      if (payload.type?.includes('output_text')) {
-        const call = activeCalls.get(streamSid);
-        const delta = payload.delta || payload.text || payload.output_text;
-        if (call && delta) {
-          call.agentTranscript.push(Array.isArray(delta) ? delta.join(' ') : delta);
-        }
-      }
-
-      if (RESPONSE_COMPLETION_EVENTS.has(payload.type)) {
-        const call = activeCalls.get(streamSid);
-        if (call) {
-          call.awaitingResponse = false;
-        }
-      }
-    },
-    close: () => {
-      console.log('OpenAI realtime WebSocket closed');
-      cleanupActiveCall().finally(() => {
-        if (twilioSocket.readyState === WebSocket.OPEN) {
-          twilioSocket.close();
-        }
-      });
-    },
-    error: (err) => {
-      console.error('Error from OpenAI realtime WebSocket', err);
-      cleanupActiveCall().finally(() => {
-        teardown();
-      });
-    }
-  };
-
-  const bindOpenAIHandlers = (socket) => {
-    if (!socket) return;
-    socket.on('message', openAIHandlers.message);
-    socket.on('close', openAIHandlers.close);
-    socket.on('error', openAIHandlers.error);
-  };
-
-  twilioSocket.on('message', (data) => {
-    let event;
-    try {
-      event = JSON.parse(data.toString());
-    } catch (err) {
-      console.error('Failed to parse Twilio media message', err);
-      return;
-    }
-
-    if (event.event === 'start') {
-      streamSid = event.start?.streamSid;
-      activeCalls.set(streamSid, {
-        streamSid,
-        from: event.start?.from,
-        to: event.start?.to,
-        callerAudio: [],
-        agentAudio: [],
-        callerTranscript: [],
-        agentTranscript: [],
-        awaitingResponse: false
-      });
-      openAISocket = createOpenAIClient(streamSid, {
-        from: event.start?.from,
-        to: event.start?.to
-      });
-      bindOpenAIHandlers(openAISocket);
-      return;
-    }
-
-    if (event.event === 'media' && event.media?.payload) {
-      const call = activeCalls.get(streamSid);
-      if (call) {
-        call.callerAudio.push(Buffer.from(event.media.payload, 'base64'));
-      }
-      relayAudioToOpenAI(openAISocket, event.media.payload);
-      if (call) {
-        requestOpenAIResponse(openAISocket, call);
-      }
-      return;
-    }
-
-    if (event.event === 'stop') {
-      console.log('Twilio stream stopped');
-      cleanupActiveCall({ summarize: true })
-        .catch((err) => console.error('Failed to process call summary', err))
-        .finally(() => {
-          teardown();
-        });
-      }
-  });
-
-  twilioSocket.on('close', () => {
-    console.log('Twilio media WebSocket closed');
-    cleanupActiveCall().finally(() => {
-      if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
-        openAISocket.close();
-      }
-    });
-  });
-
-  twilioSocket.on('error', (err) => {
-    console.error('Error from Twilio media WebSocket', err);
-    cleanupActiveCall().finally(() => {
-      teardown();
-    });
-  });
-
 });
 
 process.on('SIGINT', () => {
