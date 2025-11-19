@@ -142,10 +142,6 @@ function buildCallAcceptPayload(callEvent) {
         voice: OPENAI_VOICE
       }
     },
-    metadata: {
-      from,
-      to
-    },
     ...(tools ? { tools } : {})
   };
 }
