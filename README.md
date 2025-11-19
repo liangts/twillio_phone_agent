@@ -33,6 +33,11 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
      - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`: Twilio REST credentials that can control the conference hosting your caller + AI.
      - `HUMAN_AGENT_NUMBER`: PSTN/SIP destination for escalations.
      - `TWILIO_HUMAN_LABEL`: Participant label to use when the helper joins your conference.
+   - Optional Discord transcript streaming:
+     - `DISCORD_WEBHOOK_URL`: Discord webhook endpoint for posting live transcripts/notifications.
+   - Optional transcription tuning:
+      - `INPUT_TRANSCRIPTION_MODEL`: Speech-to-text model for caller audio (default `gpt-4o-mini-transcribe`).
+      - `INPUT_TRANSCRIPTION_LANGUAGE`: Force transcription language (leave blank for auto).
 4. **Start the server**
    ```bash
    npm start
@@ -58,7 +63,7 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
 
 - `/openai/webhook` verifies the `X-OpenAI-Signature`, accepts `realtime.call.incoming` events, and acknowledges other call lifecycle events with `200 OK`.
 - Accepting a call posts your prompt/voice/metadata via `/v1/realtime/calls/{call_id}/accept`, then connects to the Realtime Calls WebSocket (`wss://api.openai.com/v1/realtime?call_id=...`).
-- The WebSocket handler logs transcripts, greets the caller (if `WELCOME_MESSAGE` is set), and reacts to tool calls (warm transfer, CRM lookups, etc.). If Twilio credentials + `HUMAN_AGENT_NUMBER` are present, the server registers a `transfer_to_human` tool that automatically dials your teammate via Programmable SIP when the model invokes it.
+- The WebSocket handler logs transcripts, greets the caller (if `WELCOME_MESSAGE` is set), and reacts to tool calls (warm transfer, CRM lookups, etc.). Caller and agent utterances are transcribed turn-by-turn; each completed sentence is sent to Discord (if `DISCORD_WEBHOOK_URL` is present) in the form `Caller: ...` / `Agent: ...`. If Twilio credentials + `HUMAN_AGENT_NUMBER` are present, the server registers a `transfer_to_human` tool that automatically dials your teammate via Programmable SIP when the model invokes it.
 - `GET /health` returns `{"status":"ok"}` for uptime checks.
 
 ### Enabling the warm-transfer tool

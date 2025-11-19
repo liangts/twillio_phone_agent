@@ -5,6 +5,7 @@ const dotenv = require('dotenv');
 const WebSocket = require('ws');
 const OpenAI = require('openai');
 const Twilio = require('twilio');
+const fetch = require('node-fetch');
 
 dotenv.config();
 
@@ -20,6 +21,9 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const HUMAN_AGENT_NUMBER = process.env.HUMAN_AGENT_NUMBER;
 const TWILIO_HUMAN_LABEL = process.env.TWILIO_HUMAN_LABEL || 'human agent';
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
+const INPUT_TRANSCRIPTION_MODEL = process.env.INPUT_TRANSCRIPTION_MODEL || 'gpt-4o-mini-transcribe';
+const INPUT_TRANSCRIPTION_LANGUAGE = process.env.INPUT_TRANSCRIPTION_LANGUAGE || '';
 
 if (!OPENAI_API_KEY) {
   console.error('Missing OPENAI_API_KEY. Cannot accept calls without an API key.');
@@ -41,6 +45,10 @@ const twilioClient =
     : null;
 
 const toolHandlers = new Map();
+
+if (!DISCORD_WEBHOOK_URL) {
+  console.log('DISCORD_WEBHOOK_URL is not configured; Discord notifications are disabled.');
+}
 
 if (twilioClient && HUMAN_AGENT_NUMBER) {
   toolHandlers.set('transfer_to_human', {
@@ -132,16 +140,32 @@ function buildCallAcceptPayload(callEvent) {
   const from = callEvent?.data?.from?.number || callEvent?.data?.from || 'unknown';
   const to = callEvent?.data?.to?.number || callEvent?.data?.to || 'unknown';
   const tools = getToolDefinitions();
+  const transcription =
+    INPUT_TRANSCRIPTION_MODEL
+      ? {
+          model: INPUT_TRANSCRIPTION_MODEL,
+          ...(INPUT_TRANSCRIPTION_LANGUAGE ? { language: INPUT_TRANSCRIPTION_LANGUAGE } : {})
+        }
+      : null;
+
+  const audioConfig = {
+    output: {
+      voice: OPENAI_VOICE
+    }
+  };
+
+  if (transcription) {
+    audioConfig.input = {
+      transcription
+    };
+  }
 
   return {
     type: 'realtime',
     model: OPENAI_MODEL,
     instructions,
-    audio: {
-      output: {
-        voice: OPENAI_VOICE
-      }
-    },
+    output_modalities: ['audio'],
+    audio: audioConfig,
     ...(tools ? { tools } : {})
   };
 }
@@ -176,6 +200,9 @@ function createCallState(callId, callEvent) {
       caller: [],
       agent: []
     },
+    transcriptLog: [],
+    currentCallerText: '',
+    currentAgentText: '',
     createdAt: Date.now(),
     pendingToolCalls: new Map()
   };
@@ -215,6 +242,52 @@ function sendSystemResponse(call, instructions) {
       }
     })
   );
+}
+
+function normalizeTextFragment(fragment) {
+  if (!fragment) return '';
+  if (typeof fragment === 'string') return fragment;
+  if (Array.isArray(fragment)) {
+    return fragment.map((part) => normalizeTextFragment(part)).filter(Boolean).join(' ');
+  }
+  if (typeof fragment === 'object') {
+    if (Array.isArray(fragment.text)) {
+      return fragment.text.map((part) => normalizeTextFragment(part)).filter(Boolean).join(' ');
+    }
+    if (typeof fragment.text === 'string') {
+      return fragment.text;
+    }
+    if (typeof fragment.value === 'string') {
+      return fragment.value;
+    }
+  }
+  return '';
+}
+
+function appendTranscriptBuffer(buffer, fragment) {
+  const text = normalizeTextFragment(fragment);
+  if (!text) return buffer || '';
+  return `${buffer || ''}${text}`;
+}
+
+function recordTranscriptLine(call, speaker, text) {
+  const normalized = normalizeTextFragment(text);
+  if (!normalized) return;
+  const trimmed = normalized.trim();
+  if (!trimmed) return;
+
+  if (speaker === 'Caller') {
+    call.transcripts.caller.push(trimmed);
+  } else {
+    call.transcripts.agent.push(trimmed);
+  }
+
+  if (Array.isArray(call.transcriptLog)) {
+    call.transcriptLog.push({ speaker, text: trimmed, at: Date.now() });
+  }
+
+  const line = `${speaker}: ${trimmed}`;
+  sendDiscordMessage(line);
 }
 
 function handleToolCallDelta(call, delta) {
@@ -298,6 +371,80 @@ async function executeToolCall(call, toolCall) {
   }
 }
 
+function processCallerTranscriptEvent(call, payload) {
+  const type = payload?.type;
+  if (!type) return false;
+
+  if (type === 'conversation.item.input_audio_transcription.delta') {
+    call.currentCallerText = appendTranscriptBuffer(call.currentCallerText, payload.delta || payload.text);
+    return true;
+  }
+
+  if (type === 'conversation.item.input_audio_transcription.completed') {
+    const transcript = payload.transcript || call.currentCallerText;
+    recordTranscriptLine(call, 'Caller', transcript);
+    call.currentCallerText = '';
+    return true;
+  }
+
+  if (type === 'conversation.item.input_text.delta' || (type.includes('input_text') && type.endsWith('.delta'))) {
+    call.currentCallerText = appendTranscriptBuffer(
+      call.currentCallerText,
+      payload.delta || payload.text || payload.input_text
+    );
+    return true;
+  }
+
+  if (
+    type === 'conversation.item.input_text.completed' ||
+    type === 'conversation.item.input_text.done' ||
+    (type.includes('input_text') && (type.endsWith('.completed') || type.endsWith('.done')))
+  ) {
+    const transcript = payload.text || payload.input_text || call.currentCallerText;
+    recordTranscriptLine(call, 'Caller', transcript);
+    call.currentCallerText = '';
+    return true;
+  }
+
+  return false;
+}
+
+function processAgentTranscriptEvent(call, payload) {
+  const type = payload?.type;
+  if (!type) return false;
+
+  if (type === 'response.audio_transcript.delta') {
+    call.currentAgentText = appendTranscriptBuffer(call.currentAgentText, payload.delta || payload.text);
+    return true;
+  }
+
+  if (type === 'response.audio_transcript.done') {
+    const transcript = payload.transcript || call.currentAgentText;
+    recordTranscriptLine(call, 'Agent', transcript);
+    call.currentAgentText = '';
+    return true;
+  }
+
+  if (type === 'response.output_text.delta' || (type.includes('output_text') && type.endsWith('.delta'))) {
+    const fragment = payload.delta || payload.text || payload.output_text;
+    call.currentAgentText = appendTranscriptBuffer(call.currentAgentText, fragment);
+    return true;
+  }
+
+  if (
+    type === 'response.output_text.done' ||
+    type === 'response.output_text.completed' ||
+    (type.includes('output_text') && (type.endsWith('.done') || type.endsWith('.completed')))
+  ) {
+    const fragment = payload.output_text || payload.text || call.currentAgentText;
+    recordTranscriptLine(call, 'Agent', fragment);
+    call.currentAgentText = '';
+    return true;
+  }
+
+  return false;
+}
+
 function handleRealtimeMessage(call, raw) {
   let payload;
   try {
@@ -307,23 +454,12 @@ function handleRealtimeMessage(call, raw) {
     return;
   }
 
-  switch (payload.type) {
-    case 'response.output_text.delta':
-      if (payload.delta) {
-        call.transcripts.agent.push(Array.isArray(payload.delta) ? payload.delta.join(' ') : payload.delta);
-      }
-      break;
-    case 'response.output_audio.delta':
-      // Nothing to relay back—OpenAI streams audio directly to the caller via SIP.
-      break;
-    default:
-      if (payload.type?.includes('input_text')) {
-        const delta = payload.delta || payload.text || payload.input_text;
-        if (delta) {
-          call.transcripts.caller.push(Array.isArray(delta) ? delta.join(' ') : delta);
-        }
-      }
-      break;
+  if (processCallerTranscriptEvent(call, payload)) {
+    return;
+  }
+
+  if (processAgentTranscriptEvent(call, payload)) {
+    return;
   }
 
   if (payload.type === 'response.output_tool_call.delta') {
@@ -467,3 +603,39 @@ process.on('SIGINT', () => {
   console.log('Shutting down server');
   server.close(() => process.exit(0));
 });
+async function sendDiscordMessage(content, webhookUrl = DISCORD_WEBHOOK_URL) {
+  if (!webhookUrl) {
+    console.warn('Discord webhook URL is not configured. Skipping message.', content?.slice?.(0, 80));
+    return;
+  }
+
+  if (!content) return;
+  const chunks = chunkString(content, 1900);
+  for (let i = 0; i < chunks.length; i++) {
+    const suffix = chunks.length > 1 ? ` (part ${i + 1}/${chunks.length})` : '';
+    try {
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: `${chunks[i]}${suffix}`
+        })
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        console.error('Failed to post Discord message', response.status, text);
+      }
+    } catch (err) {
+      console.error('Discord webhook request failed', err);
+    }
+  }
+}
+
+function chunkString(str, length) {
+  if (!str) return [];
+  const result = [];
+  for (let i = 0; i < str.length; i += length) {
+    result.push(str.slice(i, i + length));
+  }
+  return result;
+}
