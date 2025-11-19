@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const dotenv = require('dotenv');
+const nodemailer = require('nodemailer');
 const WebSocket = require('ws');
 
 dotenv.config();
@@ -11,13 +12,42 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-realtime';
 const PUBLIC_URL = process.env.PUBLIC_URL;
 const PROMPT_PATH = process.env.PROMPT_PATH || path.join(__dirname, '..', 'config', 'agent_prompt.md');
+const SMTP_HOST = process.env.SMTP_HOST;
+const SMTP_PORT = process.env.SMTP_PORT;
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
+const EMAIL_FROM = process.env.EMAIL_FROM;
+const EMAIL_TO = process.env.EMAIL_TO;
 
 if (!OPENAI_API_KEY) {
   console.warn('Warning: OPENAI_API_KEY is not set. The bridge will not connect to OpenAI until it is configured.');
 }
 
-if (!PUBLIC_URL) {
-  console.warn('Warning: PUBLIC_URL is not set. Twilio will not be able to connect to your media stream without a publicly reachable URL.');
+function normalizeBaseUrl(url) {
+  if (!url) return null;
+  return url.replace(/\/$/, '');
+}
+
+function httpToWs(url) {
+  if (!url) return null;
+  if (url.startsWith('ws://') || url.startsWith('wss://')) {
+    return url;
+  }
+  if (url.startsWith('https://')) {
+    return `wss://${url.slice('https://'.length)}`;
+  }
+  if (url.startsWith('http://')) {
+    return `ws://${url.slice('http://'.length)}`;
+  }
+  return `wss://${url}`;
+}
+
+const PUBLIC_HTTP_BASE = normalizeBaseUrl(PUBLIC_URL);
+const PUBLIC_WS_BASE = httpToWs(PUBLIC_HTTP_BASE);
+
+if (!PUBLIC_HTTP_BASE) {
+  console.warn('Warning: PUBLIC_URL is not set. Twilio will not be able to connect to your webhook or media stream without a publicly reachable URL.');
 }
 
 const app = express();
@@ -38,16 +68,16 @@ app.get('/health', (_req, res) => {
 });
 
 app.post('/voice', (req, res) => {
-  const streamUrl = `${PUBLIC_URL?.replace(/\/$/, '')}/media`;
-  if (!PUBLIC_URL) {
-    console.error('PUBLIC_URL is missing. Twilio cannot be pointed to the media WebSocket.');
+  const streamUrl = PUBLIC_WS_BASE ? `${PUBLIC_WS_BASE}/media` : null;
+  if (!PUBLIC_HTTP_BASE || !streamUrl) {
+    console.error('PUBLIC_URL is missing or invalid. Twilio cannot be pointed to the media WebSocket.');
   }
 
   const twiml = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<Response>',
     '  <Connect>',
-    `    <Stream url="${streamUrl}" track="inbound_track"/>`,
+    `    <Stream url="${streamUrl || ''}" track="inbound_track"/>`,
     '  </Connect>',
     '</Response>'
   ].join('\n');
@@ -60,6 +90,91 @@ const server = app.listen(PORT, () => {
 });
 
 const wss = new WebSocket.Server({ server, path: '/media' });
+
+const activeCalls = new Map();
+
+function createMulawWavBuffer(dataBuffers) {
+  const data = Buffer.concat(dataBuffers);
+  const header = Buffer.alloc(44);
+  const dataSize = data.length;
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16); // PCM header size
+  header.writeUInt16LE(7, 20); // mu-law format code
+  header.writeUInt16LE(1, 22); // channels
+  header.writeUInt32LE(8000, 24); // sample rate
+  header.writeUInt32LE(8000, 28); // byte rate
+  header.writeUInt16LE(1, 32); // block align
+  header.writeUInt16LE(8, 34); // bits per sample
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, data]);
+}
+
+function createMailTransport() {
+  if (!SMTP_HOST || !EMAIL_FROM || !EMAIL_TO) {
+    console.warn('Email is not configured. Set SMTP_HOST, EMAIL_FROM, and EMAIL_TO to enable summaries.');
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT) || 587,
+    secure: SMTP_SECURE,
+    auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined
+  });
+}
+
+async function emailCallSummary(call) {
+  const transport = createMailTransport();
+  if (!transport) return;
+
+  const callerTranscript = call.callerTranscript.join('').trim();
+  const agentTranscript = call.agentTranscript.join('').trim();
+
+  const attachments = [];
+  if (call.callerAudio.length) {
+    attachments.push({
+      filename: `caller-${call.streamSid}.wav`,
+      content: createMulawWavBuffer(call.callerAudio)
+    });
+  }
+  if (call.agentAudio.length) {
+    attachments.push({
+      filename: `agent-${call.streamSid}.wav`,
+      content: createMulawWavBuffer(call.agentAudio)
+    });
+  }
+
+  const subject = `Call summary for ${call.streamSid}`;
+  const text = [
+    `From: ${call.from || 'unknown'}`,
+    `To: ${call.to || 'unknown'}`,
+    '',
+    'Caller transcript:',
+    callerTranscript || '(none)',
+    '',
+    'Agent transcript:',
+    agentTranscript || '(none)'
+  ].join('\n');
+
+  try {
+    await transport.sendMail({
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
+      subject,
+      text,
+      attachments
+    });
+    console.log(`Sent call summary email for ${call.streamSid}`);
+  } catch (err) {
+    console.error('Failed to send call summary email', err);
+  }
+}
 
 function createOpenAIClient(streamSid, callInfo = {}) {
   if (!OPENAI_API_KEY) return null;
@@ -149,6 +264,15 @@ wss.on('connection', (twilioSocket) => {
 
     if (event.event === 'start') {
       streamSid = event.start?.streamSid;
+      activeCalls.set(streamSid, {
+        streamSid,
+        from: event.start?.from,
+        to: event.start?.to,
+        callerAudio: [],
+        agentAudio: [],
+        callerTranscript: [],
+        agentTranscript: []
+      });
       openAISocket = createOpenAIClient(streamSid, {
         from: event.start?.from,
         to: event.start?.to
@@ -157,13 +281,25 @@ wss.on('connection', (twilioSocket) => {
     }
 
     if (event.event === 'media' && event.media?.payload) {
+      const call = activeCalls.get(streamSid);
+      if (call) {
+        call.callerAudio.push(Buffer.from(event.media.payload, 'base64'));
+      }
       relayAudioToOpenAI(openAISocket, event.media.payload);
       return;
     }
 
     if (event.event === 'stop') {
       console.log('Twilio stream stopped');
-      teardown();
+      const call = activeCalls.get(streamSid);
+      if (call) {
+        emailCallSummary(call).finally(() => {
+          activeCalls.delete(streamSid);
+          teardown();
+        });
+      } else {
+        teardown();
+      }
     }
   });
 
@@ -190,7 +326,27 @@ wss.on('connection', (twilioSocket) => {
       }
 
       if (payload.type === 'response.output_audio.delta' && payload.delta) {
+        const call = activeCalls.get(streamSid);
+        if (call) {
+          call.agentAudio.push(Buffer.from(payload.delta, 'base64'));
+        }
         relayAudioToTwilio(twilioSocket, streamSid, payload.delta);
+      }
+
+      if (payload.type?.includes('input_text')) {
+        const call = activeCalls.get(streamSid);
+        const delta = payload.delta || payload.text || payload.input_text;
+        if (call && delta) {
+          call.callerTranscript.push(delta);
+        }
+      }
+
+      if (payload.type?.includes('output_text')) {
+        const call = activeCalls.get(streamSid);
+        const delta = payload.delta || payload.text || payload.output_text;
+        if (call && delta) {
+          call.agentTranscript.push(Array.isArray(delta) ? delta.join(' ') : delta);
+        }
       }
     },
     close: () => {
@@ -212,17 +368,7 @@ wss.on('connection', (twilioSocket) => {
     openAISocket.on('error', openAIHandlers.error);
   };
 
-  const openAIInterval = setInterval(() => {
-    if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
-      clearInterval(openAIInterval);
-    }
-    if (openAISocket && openAISocket.readyState === WebSocket.CONNECTING) {
-      return;
-    }
-    if (openAISocket && openAISocket.readyState === WebSocket.OPEN) {
-      bindOpenAIHandlers();
-    }
-  }, 100);
+  bindOpenAIHandlers();
 });
 
 process.on('SIGINT', () => {
