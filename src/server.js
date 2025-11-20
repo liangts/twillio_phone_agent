@@ -179,9 +179,42 @@ function resolveWsUrl(callEvent, callId) {
   );
 }
 
+function getSipHeaderValue(sipHeaders = [], headerName) {
+  if (!Array.isArray(sipHeaders) || !headerName) return null;
+  const target = headerName.toLowerCase();
+  const header = sipHeaders.find((h) => (h?.name || '').toLowerCase() === target);
+  return header?.value || null;
+}
+
+function getNumberFromHeader(value) {
+  if (typeof value !== 'string') return null;
+  const match = value.match(/\+?\d{7,15}/);
+  return match ? match[0] : null;
+}
+
 function createCallState(callId, callEvent) {
-  const from = callEvent?.data?.from?.number || callEvent?.data?.from || 'unknown';
-  const to = callEvent?.data?.to?.number || callEvent?.data?.to || 'unknown';
+  const sipHeaders = callEvent?.data?.sip_headers || [];
+  const rawFromHeader = getSipHeaderValue(sipHeaders, 'from');
+  const rawToHeader = getSipHeaderValue(sipHeaders, 'to');
+  const rawDiversionHeader = getSipHeaderValue(sipHeaders, 'diversion');
+  const rawHistoryInfoHeader = getSipHeaderValue(sipHeaders, 'history-info');
+
+  const forwardedHeader = rawDiversionHeader || rawHistoryInfoHeader || null;
+  const forwardedFromNumber = getNumberFromHeader(forwardedHeader);
+
+  const from =
+    callEvent?.data?.from?.number ||
+    callEvent?.data?.from ||
+    getNumberFromHeader(rawFromHeader) ||
+    rawFromHeader ||
+    'unknown';
+  const to =
+    callEvent?.data?.to?.number ||
+    callEvent?.data?.to ||
+    getNumberFromHeader(rawToHeader) ||
+    rawToHeader ||
+    'unknown';
+
   const callToken =
     callEvent?.data?.call_token ||
     callEvent?.data?.twilio?.call_token ||
@@ -204,7 +237,12 @@ function createCallState(callId, callEvent) {
     currentCallerText: '',
     currentAgentText: '',
     createdAt: Date.now(),
-    pendingToolCalls: new Map()
+    pendingToolCalls: new Map(),
+    rawFromHeader,
+    rawToHeader,
+    rawDiversionHeader,
+    rawHistoryInfoHeader,
+    forwardedFrom: forwardedFromNumber || forwardedHeader || null
   };
 }
 
@@ -288,6 +326,27 @@ function recordTranscriptLine(call, speaker, text) {
 
   const line = `${speaker}: ${trimmed}`;
   sendDiscordMessage(line);
+}
+
+function announceIncomingCall(call) {
+  if (!call) return;
+  const lines = [`Call ${call.callId} accepted.`];
+
+  if (call.rawFromHeader || call.from) {
+    lines.push(`From header: ${call.rawFromHeader || call.from}`);
+  }
+
+  if (call.rawDiversionHeader || call.rawHistoryInfoHeader) {
+    lines.push(
+      `Diversion header: ${call.rawDiversionHeader || call.rawHistoryInfoHeader}`
+    );
+  }
+
+  if (call.forwardedFrom && (call.rawDiversionHeader || call.rawHistoryInfoHeader)) {
+    lines.push(`Forwarded from number: ${call.forwardedFrom}`);
+  }
+
+  sendDiscordMessage(lines.join('\n'));
 }
 
 function handleToolCallDelta(call, delta) {
@@ -543,6 +602,8 @@ async function acceptIncomingCall(callEvent) {
     const text = await resp.text().catch(() => '');
     throw new Error(`Failed to accept call ${callId}: ${resp.status} ${resp.statusText} ${text}`);
   }
+
+  announceIncomingCall(callState);
 
   const wsUrl = resolveWsUrl(callEvent, callId);
   connectRealtimeSocket(callState, wsUrl);
