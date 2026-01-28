@@ -15,5 +15,8 @@
     "openai": "^6.9.1",
     "twilio": "^5.10.5",
     "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.61.0"
   }
 }
