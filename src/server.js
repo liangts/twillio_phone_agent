@@ -436,6 +436,10 @@ function announceIncomingCall(call) {
   if (!call) return;
   const lines = [`Call ${call.callId} accepted.`];
 
+  if (call.conferenceName) {
+    lines.push(`Conference: ${call.conferenceName}`);
+  }
+
   if (call.rawFromHeader || call.from) {
     lines.push(`From header: ${call.rawFromHeader || call.from}`);
   }
