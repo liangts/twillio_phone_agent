@@ -24,6 +24,9 @@ const TWILIO_HUMAN_LABEL = process.env.TWILIO_HUMAN_LABEL || 'human agent';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const INPUT_TRANSCRIPTION_MODEL = process.env.INPUT_TRANSCRIPTION_MODEL || 'gpt-4o-mini-transcribe';
 const INPUT_TRANSCRIPTION_LANGUAGE = process.env.INPUT_TRANSCRIPTION_LANGUAGE || '';
+const CF_INGEST_BASE_URL = process.env.CF_INGEST_BASE_URL || '';
+const CF_INGEST_TOKEN = process.env.CF_INGEST_TOKEN || '';
+const INGEST_ENABLED = Boolean(CF_INGEST_BASE_URL && CF_INGEST_TOKEN);
 
 if (!OPENAI_API_KEY) {
   console.error('Missing OPENAI_API_KEY. Cannot accept calls without an API key.');
@@ -48,6 +51,10 @@ const toolHandlers = new Map();
 
 if (!DISCORD_WEBHOOK_URL) {
   console.log('DISCORD_WEBHOOK_URL is not configured; Discord notifications are disabled.');
+}
+
+if (!INGEST_ENABLED) {
+  console.log('Cloudflare ingest is disabled (missing CF_INGEST_BASE_URL or CF_INGEST_TOKEN).');
 }
 
 if (twilioClient && HUMAN_AGENT_NUMBER) {
@@ -228,6 +235,7 @@ function createCallState(callId, callEvent) {
     to,
     callToken,
     conferenceName,
+    provider: callEvent?.data?.provider || (callEvent?.data?.twilio ? 'twilio' : null),
     ws: null,
     transcripts: {
       caller: [],
@@ -236,6 +244,9 @@ function createCallState(callId, callEvent) {
     transcriptLog: [],
     currentCallerText: '',
     currentAgentText: '',
+    transcriptSeq: 0,
+    status: 'incoming',
+    endedAt: null,
     createdAt: Date.now(),
     pendingToolCalls: new Map(),
     rawFromHeader,
@@ -263,11 +274,103 @@ function extractConferenceName(callEvent) {
 function closeActiveCall(callId, reason = 'unknown') {
   const call = activeCalls.get(callId);
   if (!call) return;
+  markCallEnded(call, reason);
   if (call.ws && call.ws.readyState === WebSocket.OPEN) {
     call.ws.close();
   }
   activeCalls.delete(callId);
   console.log(`Cleaned up call ${callId} (${reason})`);
+}
+
+function normalizeSpeaker(speaker) {
+  if (!speaker) return 'system';
+  const lower = speaker.toLowerCase();
+  if (lower.includes('caller')) return 'caller';
+  if (lower.includes('agent')) return 'agent';
+  return lower;
+}
+
+function buildIngestUrl(pathname) {
+  const base = CF_INGEST_BASE_URL.replace(/\/+$/, '');
+  return `${base}${pathname}`;
+}
+
+async function sendIngestRequest(pathname, payload) {
+  if (!INGEST_ENABLED) return;
+  try {
+    const response = await fetch(buildIngestUrl(pathname), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${CF_INGEST_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      console.warn(`Ingest ${pathname} failed`, response.status, text);
+    }
+  } catch (err) {
+    console.warn(`Ingest ${pathname} request failed`, err?.message || err);
+  }
+}
+
+function buildCallPayload(call, overrides = {}) {
+  const ts = overrides.ts || Math.floor(Date.now() / 1000);
+  const baseMeta = {
+    forwarded_from: call.forwardedFrom || null,
+    sip_headers: {
+      from: call.rawFromHeader || null,
+      to: call.rawToHeader || null,
+      diversion: call.rawDiversionHeader || null,
+      history_info: call.rawHistoryInfoHeader || null
+    }
+  };
+  const { meta: overrideMeta, ...restOverrides } = overrides;
+  return {
+    call_id: call.callId,
+    status: call.status,
+    ts,
+    from_uri: call.from,
+    to_uri: call.to,
+    provider: call.provider,
+    conference_name: call.conferenceName,
+    call_token: call.callToken,
+    meta: { ...baseMeta, ...(overrideMeta || {}) },
+    ...restOverrides
+  };
+}
+
+async function sendIngestCall(call, event, overrides = {}) {
+  if (!INGEST_ENABLED || !call) return;
+  const payload = buildCallPayload(call, { event, ...overrides });
+  await sendIngestRequest('/ingest/call', payload);
+}
+
+async function sendIngestTranscript(call, speaker, text) {
+  if (!INGEST_ENABLED || !call) return;
+  const normalized = normalizeTextFragment(text).trim();
+  if (!normalized) return;
+  call.transcriptSeq += 1;
+  const payload = {
+    call_id: call.callId,
+    seq: call.transcriptSeq,
+    ts: Date.now(),
+    speaker: normalizeSpeaker(speaker),
+    text: normalized
+  };
+  await sendIngestRequest('/ingest/transcript', payload);
+}
+
+function markCallEnded(call, reason) {
+  if (!call || call.endedAt) return;
+  call.endedAt = Date.now();
+  call.status = 'ended';
+  sendIngestCall(call, 'end', {
+    status: 'ended',
+    ts: Math.floor(call.endedAt / 1000),
+    meta: { ...(call.meta || {}), reason }
+  }).catch(() => {});
 }
 
 function sendSystemResponse(call, instructions) {
@@ -326,6 +429,7 @@ function recordTranscriptLine(call, speaker, text) {
 
   const line = `${speaker}: ${trimmed}`;
   sendDiscordMessage(line);
+  sendIngestTranscript(call, speaker, trimmed).catch(() => {});
 }
 
 function announceIncomingCall(call) {
@@ -550,6 +654,8 @@ function connectRealtimeSocket(call, wsUrl) {
 
     ws.on('open', () => {
       console.log(`Realtime socket open for call ${call.callId}`);
+      call.status = 'live';
+      sendIngestCall(call, 'status', { status: 'live' }).catch(() => {});
       if (WELCOME_MESSAGE) {
         const message = {
           type: 'response.create',
@@ -565,6 +671,7 @@ function connectRealtimeSocket(call, wsUrl) {
 
     ws.on('close', (code, reason) => {
       console.log(`Realtime socket closed for ${call.callId}`, code, reason?.toString?.());
+      markCallEnded(call, 'ws_close');
       activeCalls.delete(call.callId);
     });
 
@@ -583,6 +690,7 @@ async function acceptIncomingCall(callEvent) {
 
   const callState = createCallState(callId, callEvent);
   activeCalls.set(callId, callState);
+  await sendIngestCall(callState, 'start', { status: 'incoming' });
 
   const acceptPayload = buildCallAcceptPayload(callEvent);
   const resp = await fetch(
@@ -598,6 +706,8 @@ async function acceptIncomingCall(callEvent) {
   );
 
   if (!resp.ok) {
+    callState.status = 'failed';
+    await sendIngestCall(callState, 'status', { status: 'failed' });
     activeCalls.delete(callId);
     const text = await resp.text().catch(() => '');
     throw new Error(`Failed to accept call ${callId}: ${resp.status} ${resp.statusText} ${text}`);

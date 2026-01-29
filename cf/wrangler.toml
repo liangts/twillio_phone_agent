@@ -1,0 +1,17 @@
+name = "call-console-api"
+main = "src/index.js"
+compatibility_date = "2025-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "call_console"
+database_id = "282af1bb-a9d1-400b-9803-83764f69072b"
+
+[durable_objects]
+bindings = [
+  { name = "CALL_ROOM", class_name = "CallRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["CallRoom"]

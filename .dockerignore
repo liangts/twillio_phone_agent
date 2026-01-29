@@ -1,4 +1,19 @@
+# Node / build
 node_modules
 npm-debug.log*
+
+# Env files
 .env
+.env.local
+
+# Git
+.git
+.gitignore
+
+# Cloudflare worker
+cf
+.wrangler
+**/.wrangler
+
+# OS
 .DS_Store
