@@ -29,10 +29,10 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
    - `PROMPT_PATH`: Path to the markdown file that defines your system instructions.
    - `WELCOME_MESSAGE`: Optional greeting that is spoken as soon as the WebSocket comes up.
    - `PORT`: Local port for the Express server (default `3000`).
-   - Optional Twilio warm-transfer settings:
-     - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`: Twilio REST credentials that can control the conference hosting your caller + AI.
-     - `HUMAN_AGENT_NUMBER`: PSTN/SIP destination for escalations.
-     - `TWILIO_HUMAN_LABEL`: Participant label to use when the helper joins your conference.
+   - Optional transfer settings:
+     - `HUMAN_AGENT_NUMBER`: PSTN destination in E.164 format (`+15551112222`). The server automatically converts it to `tel:+15551112222` for OpenAI SIP refer transfers.
+     - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`: Optional Twilio REST credentials used only for conference-based transfer fallback flows.
+     - `TWILIO_HUMAN_LABEL`: Participant label used for Twilio conference fallback transfers.
      - `CONTROL_API_TOKEN`: Optional bearer token required by manual control endpoints (`/control/calls/:call_id/*`).
    - Optional Discord transcript streaming:
      - `DISCORD_WEBHOOK_URL`: Discord webhook endpoint for posting live transcripts/notifications.
@@ -64,7 +64,7 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
 
 - `/openai/webhook` verifies the `X-OpenAI-Signature`, accepts `realtime.call.incoming` events, and acknowledges other call lifecycle events with `200 OK`.
 - Accepting a call posts your prompt/voice/metadata via `/v1/realtime/calls/{call_id}/accept`, then connects to the Realtime Calls WebSocket (`wss://api.openai.com/v1/realtime?call_id=...`).
-- The WebSocket handler logs transcripts, greets the caller (if `WELCOME_MESSAGE` is set), and reacts to tool calls (warm transfer, CRM lookups, etc.). Caller and agent utterances are transcribed turn-by-turn; each completed sentence is sent to Discord (if `DISCORD_WEBHOOK_URL` is present) in the form `Caller: ...` / `Agent: ...`. If Twilio credentials + `HUMAN_AGENT_NUMBER` are present, the server registers a `transfer_to_human` tool that automatically dials your teammate via Programmable SIP when the model invokes it.
+- The WebSocket handler logs transcripts, greets the caller (if `WELCOME_MESSAGE` is set), and reacts to tool calls (warm transfer, CRM lookups, etc.). Caller and agent utterances are transcribed turn-by-turn; each completed sentence is sent to Discord (if `DISCORD_WEBHOOK_URL` is present) in the form `Caller: ...` / `Agent: ...`. If `HUMAN_AGENT_NUMBER` is present, the server registers a `transfer_to_human` tool that transfers the call using OpenAI SIP refer (`POST /v1/realtime/calls/{call_id}/refer`) to `tel:+...`.
 - `GET /health` returns `{"status":"ok"}` for uptime checks.
 - Manual operator controls are available from:
   - `POST /control/calls/:call_id/transfer`
@@ -82,16 +82,14 @@ If your dashboard calls the Cloudflare Worker API, configure these Worker secret
   - `CONTROL_API_ACCESS_CLIENT_ID`
   - `CONTROL_API_ACCESS_CLIENT_SECRET`
 
-### Enabling the warm-transfer tool
+### Enabling the transfer tool
 
-1. **Pass conference metadata through SIP**  
-   When Twilio invites the OpenAI SIP connector, include a header like `X-conferenceName=<conferenceSid>` so the webhook can map a Realtime call back to the active conference. The tutorials accomplish this by adding `?X-conferenceName=${conferenceName}` to the SIP URI.
-2. **Expose the call token**  
-   Twilio’s `participants.create` API returns a `CallToken`—the same token must reach this server so it can invite the human participant later. OpenAI currently forwards that token in the `realtime.call.incoming` event under `data.call_token`; confirm it’s available before enabling transfers.
-3. **Prompt the model**  
+1. **Set destination number**  
+   Configure `HUMAN_AGENT_NUMBER` in E.164 format (for example `+14155550123`).
+2. **Prompt the model**  
    Update `config/agent_prompt.md` to tell the AI when to call the `transfer_to_human` tool (for example: “If the caller asks for a person, call the `transfer_to_human` function.”).
-4. **Handle removals (optional)**  
-   When Twilio notifies you that the human joined, you can end the virtual agent’s leg via Twilio’s REST API (outside the scope of this repo but covered in the tutorial).
+3. **Twilio conference fallback (optional)**  
+   If you migrate to a Twilio conference-based warm-transfer architecture, you can also provide conference metadata (`conferenceName`, `callToken`) and Twilio credentials to transfer by adding a participant to the conference.
 
 ## Run in Docker
 

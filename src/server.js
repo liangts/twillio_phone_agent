@@ -79,54 +79,136 @@ function normalizeDialableNumber(value) {
   return match ? match[0] : null;
 }
 
-async function inviteHumanAgent(call, args = {}) {
-  if (!twilioClient || !HUMAN_AGENT_NUMBER) {
-    return {
-      status: 'error',
-      message: 'Twilio transfer is not configured on this server.'
-    };
-  }
+function normalizeReferTargetUri(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^(tel:|sip:)/i.test(trimmed)) return trimmed;
+  const normalized = normalizeDialableNumber(trimmed);
+  if (!normalized) return null;
+  return `tel:${normalized.startsWith('+') ? normalized : `+${normalized}`}`;
+}
 
+function getTransferTargetUri(args = {}) {
+  const candidates = [
+    args.target_uri,
+    args.targetUri,
+    args.to,
+    args.number,
+    HUMAN_AGENT_NUMBER
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeReferTargetUri(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+async function inviteHumanAgentViaTwilio(call, args = {}) {
+  if (!twilioClient || !HUMAN_AGENT_NUMBER) {
+    return null;
+  }
   const conferenceName = call?.conferenceName || args.conferenceName;
   const callToken = call?.callToken || args.callToken;
   const callerNumber = normalizeDialableNumber(call?.from) || normalizeDialableNumber(args.from);
 
-  if (!conferenceName || !callToken || !callerNumber) {
-    const missing = [];
-    if (!conferenceName) missing.push('conferenceName');
-    if (!callToken) missing.push('callToken');
-    if (!callerNumber) missing.push('callerNumber');
-    console.error(`transfer_to_human requested but missing metadata: ${missing.join(', ')}`);
+  if (conferenceName && callToken && callerNumber) {
+    try {
+      await twilioClient
+        .conferences(conferenceName)
+        .participants.create({
+          from: callerNumber,
+          label: TWILIO_HUMAN_LABEL,
+          to: HUMAN_AGENT_NUMBER,
+          earlyMedia: false,
+          callToken
+        });
+      console.log(`Invited human agent into conference ${conferenceName} via Twilio`);
+      return {
+        status: 'ok',
+        message:
+          args?.confirmationMessage ||
+          'Bringing a teammate into the call now. Thanks for waiting!'
+      };
+    } catch (err) {
+      console.error('Failed to add human agent via Twilio', err);
+      return {
+        status: 'error',
+        message: 'I could not reach a human agent right now.'
+      };
+    }
+  }
+  return null;
+}
+
+async function inviteHumanAgentViaRefer(call, args = {}) {
+  const targetUri = getTransferTargetUri(args);
+  if (!targetUri) {
     return {
       status: 'error',
-      message: 'I tried to add a teammate but could not find the call metadata.'
+      message: 'Transfer target is not configured. Set HUMAN_AGENT_NUMBER in E.164 format.'
     };
   }
-
   try {
-    await twilioClient
-      .conferences(conferenceName)
-      .participants.create({
-        from: callerNumber,
-        label: TWILIO_HUMAN_LABEL,
-        to: HUMAN_AGENT_NUMBER,
-        earlyMedia: false,
-        callToken
-      });
-    console.log(`Invited human agent into conference ${conferenceName}`);
+    const response = await fetch(
+      `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(call.callId)}/refer`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          target_uri: targetUri
+        })
+      }
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      console.error(
+        `Failed to refer call ${call.callId} to ${targetUri}`,
+        response.status,
+        text
+      );
+      return {
+        status: 'error',
+        message: 'I could not transfer this call right now.'
+      };
+    }
+    console.log(`Referred call ${call.callId} to ${targetUri}`);
     return {
       status: 'ok',
       message:
         args?.confirmationMessage ||
-        'Bringing a teammate into the call now. Thanks for waiting!'
+        'Let me connect you to a teammate now.'
     };
   } catch (err) {
-    console.error('Failed to add human agent via Twilio', err);
+    console.error(`Failed to refer call ${call.callId}`, err);
     return {
       status: 'error',
-      message: 'I could not reach a human agent right now.'
+      message: 'I could not transfer this call right now.'
     };
   }
+}
+
+async function inviteHumanAgent(call, args = {}) {
+  const requestedMode = (args?.transfer_mode || args?.mode || '').toLowerCase();
+  if (requestedMode === 'twilio') {
+    const twilioResult = await inviteHumanAgentViaTwilio(call, args);
+    if (twilioResult) return twilioResult;
+    return {
+      status: 'error',
+      message: 'Twilio conference transfer metadata is unavailable for this call.'
+    };
+  }
+
+  const referResult = await inviteHumanAgentViaRefer(call, args);
+  if (referResult.status === 'ok') return referResult;
+
+  const twilioFallback = await inviteHumanAgentViaTwilio(call, args);
+  if (twilioFallback) return twilioFallback;
+
+  return referResult;
 }
 
 async function requestCallHangup(callId) {
@@ -156,15 +238,20 @@ if (!INGEST_ENABLED) {
   console.log('Cloudflare ingest is disabled (missing CF_INGEST_BASE_URL or CF_INGEST_TOKEN).');
 }
 
-if (twilioClient && HUMAN_AGENT_NUMBER) {
+if (HUMAN_AGENT_NUMBER) {
   toolHandlers.set('transfer_to_human', {
-    description: 'Invite a live human agent into the current call via Twilio Programmable SIP.',
+    description:
+      'Transfer the active call to a human using SIP REFER (or Twilio conference fallback when available).',
     parameters: {
       type: 'object',
       properties: {
         reason: {
           type: 'string',
           description: 'Optional context for why the caller is being transferred.'
+        },
+        target_uri: {
+          type: 'string',
+          description: 'Optional SIP or TEL URI, for example tel:+14155550123.'
         }
       }
     },
@@ -174,7 +261,7 @@ if (twilioClient && HUMAN_AGENT_NUMBER) {
   });
 } else {
   console.log(
-    'Twilio warm transfer is disabled (missing TWILIO credentials or HUMAN_AGENT_NUMBER).'
+    'Human transfer is disabled (missing HUMAN_AGENT_NUMBER).'
   );
 }
 
