@@ -6,9 +6,17 @@ const CALLS_PAGE_SIZE = 50;
 const TRANSCRIPT_PAGE_SIZE = 200;
 
 const elements = {
+  pageRoot: document.getElementById('pageRoot'),
   apiBaseInput: document.getElementById('apiBaseInput'),
   statusFilter: document.getElementById('statusFilter'),
   refreshBtn: document.getElementById('refreshBtn'),
+  mobileTabs: document.getElementById('mobileTabs'),
+  showCallsBtn: document.getElementById('showCallsBtn'),
+  showTranscriptBtn: document.getElementById('showTranscriptBtn'),
+  callSearchInput: document.getElementById('callSearchInput'),
+  liveCount: document.getElementById('liveCount'),
+  incomingCount: document.getElementById('incomingCount'),
+  endedCount: document.getElementById('endedCount'),
   callsList: document.getElementById('callsList'),
   loadMoreCalls: document.getElementById('loadMoreCalls'),
   listStatus: document.getElementById('listStatus'),
@@ -18,6 +26,7 @@ const elements = {
   transcript: document.getElementById('transcript'),
   loadMoreTranscript: document.getElementById('loadMoreTranscript'),
   autoScrollToggle: document.getElementById('autoScrollToggle'),
+  jumpLatestBtn: document.getElementById('jumpLatestBtn'),
   wsStatus: document.getElementById('wsStatus'),
   reconnectBtn: document.getElementById('reconnectBtn'),
   transferBtn: document.getElementById('transferBtn'),
@@ -25,7 +34,8 @@ const elements = {
   actionStatus: document.getElementById('actionStatus'),
   searchInput: document.getElementById('searchInput'),
   exportJson: document.getElementById('exportJson'),
-  exportCsv: document.getElementById('exportCsv')
+  exportCsv: document.getElementById('exportCsv'),
+  toast: document.getElementById('toast')
 };
 
 const state = {
@@ -42,11 +52,15 @@ const state = {
   wsConnected: false,
   isLoadingCalls: false,
   isLoadingTranscript: false,
+  callSearchTerm: '',
   searchTerm: '',
   autoScroll: true,
+  pendingNewSegments: 0,
+  mobileView: 'calls',
   poller: null,
   reconnectTimer: null,
-  actionInFlight: false
+  actionInFlight: false,
+  toastTimer: null
 };
 
 function normalizeBase(value) {
@@ -111,12 +125,113 @@ function setStatus(el, text, variant) {
     el.style.color = '#c94f2c';
     return;
   }
+  if (variant === 'success') {
+    el.style.background = 'rgba(27, 154, 106, 0.12)';
+    el.style.color = '#1b9a6a';
+    return;
+  }
+  if (variant === 'warning') {
+    el.style.background = 'rgba(240, 180, 41, 0.2)';
+    el.style.color = '#8f6b0a';
+    return;
+  }
   el.style.background = '';
   el.style.color = '';
 }
 
 function setActionStatus(text, variant) {
   setStatus(elements.actionStatus, text, variant);
+}
+
+function showToast(message, variant = 'success', timeoutMs = 2600) {
+  if (!elements.toast || !message) return;
+  elements.toast.textContent = message;
+  elements.toast.classList.remove('hidden', 'error', 'success', 'warning');
+  if (variant) {
+    elements.toast.classList.add(variant);
+  }
+  if (state.toastTimer) {
+    clearTimeout(state.toastTimer);
+  }
+  state.toastTimer = setTimeout(() => {
+    elements.toast.classList.add('hidden');
+    elements.toast.classList.remove('error', 'success', 'warning');
+    state.toastTimer = null;
+  }, timeoutMs);
+}
+
+function isMobileViewport() {
+  return window.matchMedia('(max-width: 900px)').matches;
+}
+
+function applyMobileViewClass() {
+  if (!elements.pageRoot) return;
+  if (!isMobileViewport()) {
+    elements.pageRoot.classList.remove('view-calls', 'view-transcript');
+    if (elements.mobileTabs) {
+      elements.mobileTabs.classList.add('hidden');
+    }
+    return;
+  }
+  if (elements.mobileTabs) {
+    elements.mobileTabs.classList.remove('hidden');
+  }
+  elements.pageRoot.classList.remove('view-calls', 'view-transcript');
+  elements.pageRoot.classList.add(state.mobileView === 'transcript' ? 'view-transcript' : 'view-calls');
+  elements.showCallsBtn.classList.toggle('active', state.mobileView === 'calls');
+  elements.showTranscriptBtn.classList.toggle('active', state.mobileView === 'transcript');
+}
+
+function setMobileView(view) {
+  state.mobileView = view === 'transcript' ? 'transcript' : 'calls';
+  applyMobileViewClass();
+}
+
+function getFilteredCalls() {
+  const term = state.callSearchTerm;
+  if (!term) return state.calls;
+  return state.calls.filter((call) => {
+    const callId = (call.call_id || '').toLowerCase();
+    const fromUri = trimUri(call.from_uri || '').toLowerCase();
+    const toUri = trimUri(call.to_uri || '').toLowerCase();
+    return callId.includes(term) || fromUri.includes(term) || toUri.includes(term);
+  });
+}
+
+function updateCallSummary() {
+  let live = 0;
+  let incoming = 0;
+  let ended = 0;
+  for (const call of state.calls) {
+    const status = call?.status || '';
+    if (status === 'live') live += 1;
+    else if (status === 'incoming') incoming += 1;
+    else if (status === 'ended') ended += 1;
+  }
+  elements.liveCount.textContent = `Live ${live}`;
+  elements.incomingCount.textContent = `Incoming ${incoming}`;
+  elements.endedCount.textContent = `Ended ${ended}`;
+}
+
+function clearPendingSegments() {
+  state.pendingNewSegments = 0;
+  elements.jumpLatestBtn.classList.add('hidden');
+}
+
+function updateJumpLatestButton() {
+  if (state.pendingNewSegments <= 0) {
+    elements.jumpLatestBtn.classList.add('hidden');
+    return;
+  }
+  elements.jumpLatestBtn.textContent = `Jump to latest (${state.pendingNewSegments})`;
+  elements.jumpLatestBtn.classList.remove('hidden');
+}
+
+function isTypingElement(el) {
+  if (!el) return false;
+  const tag = (el.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+  return Boolean(el.isContentEditable);
 }
 
 function isActionableCall(call) {
@@ -143,13 +258,18 @@ function renderCalls(reset) {
   if (reset) {
     elements.callsList.innerHTML = '';
   }
-  if (state.calls.length === 0) {
-    elements.callsList.innerHTML = '<div class="empty-state">No calls yet. Incoming calls will appear here.</div>';
+  const filteredCalls = getFilteredCalls();
+  if (filteredCalls.length === 0) {
+    const emptyText = state.calls.length
+      ? 'No calls match this filter.'
+      : 'No calls yet. Incoming calls will appear here.';
+    elements.callsList.innerHTML = `<div class="empty-state">${emptyText}</div>`;
+    elements.listMeta.textContent = state.calls.length ? 'No calls match your filter.' : '0 calls';
     return;
   }
 
   const fragment = document.createDocumentFragment();
-  for (const call of state.calls) {
+  for (const call of filteredCalls) {
     const card = document.createElement('div');
     card.className = 'call-card';
     if (call.call_id === state.selectedCallId) {
@@ -183,6 +303,7 @@ function renderCalls(reset) {
   }
   elements.callsList.innerHTML = '';
   elements.callsList.appendChild(fragment);
+  elements.listMeta.textContent = `${filteredCalls.length} shown · ${state.calls.length} total`;
 }
 
 async function loadCalls({ reset }) {
@@ -206,9 +327,9 @@ async function loadCalls({ reset }) {
       state.calls = state.calls.concat(data.items || []);
     }
     state.nextCursor = data.next_cursor || null;
+    updateCallSummary();
     renderCalls(true);
     setStatus(elements.listStatus, 'Ready');
-    elements.listMeta.textContent = `${state.calls.length} calls`;
     elements.loadMoreCalls.disabled = !state.nextCursor;
   } catch (err) {
     setStatus(elements.listStatus, 'Error', 'error');
@@ -258,7 +379,9 @@ function clearTranscript() {
   state.transcript = [];
   state.lastSeq = 0;
   state.segmentSet.clear();
+  state.pendingNewSegments = 0;
   elements.transcript.innerHTML = '';
+  elements.jumpLatestBtn.classList.add('hidden');
   elements.searchInput.value = '';
   state.searchTerm = '';
   setActionStatus('Idle');
@@ -282,12 +405,14 @@ function appendSegments(segments) {
   if (!segments || segments.length === 0) return;
   const fragment = document.createDocumentFragment();
   const shouldScroll = isNearBottom();
+  let addedCount = 0;
 
   for (const segment of segments) {
     if (state.segmentSet.has(segment.seq)) continue;
     state.segmentSet.add(segment.seq);
     state.transcript.push(segment);
     state.lastSeq = Math.max(state.lastSeq, segment.seq);
+    addedCount += 1;
 
     const card = document.createElement('div');
     card.className = `segment speaker-${segment.speaker || 'system'}`;
@@ -317,6 +442,10 @@ function appendSegments(segments) {
 
   if (state.autoScroll && shouldScroll) {
     scrollTranscriptToBottom();
+    clearPendingSegments();
+  } else if (addedCount > 0) {
+    state.pendingNewSegments += addedCount;
+    updateJumpLatestButton();
   }
 }
 
@@ -344,6 +473,7 @@ function updateCallInList(callId, updates) {
   const existing = state.calls.find((item) => item.call_id === callId);
   if (!existing) return;
   Object.assign(existing, updates);
+  updateCallSummary();
   renderCalls(true);
 }
 
@@ -386,7 +516,7 @@ async function triggerCallAction(action, payload = {}) {
 
   state.actionInFlight = true;
   refreshActionButtons();
-  setActionStatus(action === 'transfer' ? 'Transferring...' : 'Ending call...');
+  setActionStatus(action === 'transfer' ? 'Transferring...' : 'Ending call...', 'warning');
 
   try {
     const response = await fetch(
@@ -425,12 +555,15 @@ async function triggerCallAction(action, payload = {}) {
       state.callDetail.ended_at = endedAt;
       renderCallMeta();
       updateCallInList(state.selectedCallId, { status: 'ended', ended_at: endedAt });
-      setActionStatus('Call ended');
+      setActionStatus('Call ended', 'success');
+      showToast('Call ended successfully.', 'success');
     } else {
-      setActionStatus('Transfer requested');
+      setActionStatus('Transfer requested', 'success');
+      showToast('Transfer request sent.', 'success');
     }
   } catch (err) {
     setActionStatus('Action failed', 'error');
+    showToast(err?.message || 'Action failed.', 'error', 3200);
     console.error(err);
   } finally {
     state.actionInFlight = false;
@@ -500,6 +633,7 @@ function isNearBottom() {
 
 function scrollTranscriptToBottom() {
   elements.transcript.scrollTop = elements.transcript.scrollHeight;
+  clearPendingSegments();
 }
 
 function updateHash() {
@@ -515,6 +649,9 @@ async function selectCall(callId) {
   updateHash();
   renderCalls(true);
   clearTranscript();
+  if (isMobileViewport()) {
+    setMobileView('transcript');
+  }
   elements.callSubtitle.textContent = 'Loading call details...';
 
   try {
@@ -569,11 +706,16 @@ function startPolling() {
 function init() {
   state.apiBase = resolveApiBase();
   elements.apiBaseInput.value = state.apiBase;
+  setMobileView('calls');
+  applyMobileViewClass();
 
   const hash = window.location.hash.replace('#', '');
   const match = hash.match(/call=([^&]+)/);
   if (match) {
     state.selectedCallId = decodeURIComponent(match[1]);
+    if (isMobileViewport()) {
+      state.mobileView = 'transcript';
+    }
   }
 
   elements.statusFilter.value = state.statusFilter;
@@ -600,6 +742,19 @@ function init() {
     loadCalls({ reset: true });
   });
 
+  elements.callSearchInput.addEventListener('input', (event) => {
+    state.callSearchTerm = event.target.value.trim().toLowerCase();
+    renderCalls(true);
+  });
+
+  elements.showCallsBtn.addEventListener('click', () => {
+    setMobileView('calls');
+  });
+
+  elements.showTranscriptBtn.addEventListener('click', () => {
+    setMobileView('transcript');
+  });
+
   elements.callsList.addEventListener('click', (event) => {
     const card = event.target.closest('.call-card');
     if (!card) return;
@@ -622,8 +777,19 @@ function init() {
     }
   });
 
+  elements.transcript.addEventListener('scroll', () => {
+    if (isNearBottom()) {
+      clearPendingSegments();
+    }
+  });
+
+  elements.jumpLatestBtn.addEventListener('click', () => {
+    scrollTranscriptToBottom();
+  });
+
   elements.reconnectBtn.addEventListener('click', () => {
     connectWebSocket();
+    showToast('Reconnecting stream...', 'warning', 1600);
   });
 
   elements.transferBtn.addEventListener('click', () => {
@@ -654,10 +820,35 @@ function init() {
     exportTranscript('csv');
   });
 
+  window.addEventListener('resize', () => {
+    applyMobileViewClass();
+  });
+
+  window.addEventListener('keydown', (event) => {
+    if (isTypingElement(document.activeElement)) {
+      return;
+    }
+    if (event.key === '/') {
+      event.preventDefault();
+      elements.searchInput.focus();
+      return;
+    }
+    if ((event.key === 'r' || event.key === 'R') && event.metaKey) {
+      return;
+    }
+    if (event.key === 'r' || event.key === 'R') {
+      event.preventDefault();
+      connectWebSocket();
+      showToast('Reconnecting stream...', 'warning', 1600);
+    }
+  });
+
   loadCalls({ reset: true });
   startPolling();
   setActionStatus('Idle');
   refreshActionButtons();
+  updateCallSummary();
+  applyMobileViewClass();
 
   if (state.selectedCallId) {
     selectCall(state.selectedCallId);

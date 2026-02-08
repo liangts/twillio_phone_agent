@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="page">
+    <div class="page" id="pageRoot">
       <header class="topbar">
         <div class="brand">
           <div class="logo-mark">CB</div>
@@ -33,6 +33,11 @@
         </div>
       </header>
 
+      <div class="mobile-tabs" id="mobileTabs">
+        <button id="showCallsBtn" class="button ghost active">Calls</button>
+        <button id="showTranscriptBtn" class="button ghost">Transcript</button>
+      </div>
+
       <main class="layout">
         <section class="panel list-panel">
           <div class="panel-header">
@@ -41,6 +46,14 @@
               <p class="muted">Select a call to stream transcripts in real time.</p>
             </div>
             <div class="status-pill" id="listStatus">Idle</div>
+          </div>
+          <div class="list-toolbar">
+            <input id="callSearchInput" type="text" placeholder="Search phone / call id" />
+            <div class="summary-row">
+              <span class="summary-pill" id="liveCount">Live 0</span>
+              <span class="summary-pill" id="incomingCount">Incoming 0</span>
+              <span class="summary-pill" id="endedCount">Ended 0</span>
+            </div>
           </div>
           <div id="callsList" class="call-list">
             <div class="empty-state">No calls loaded yet.</div>
@@ -91,7 +104,10 @@
             </div>
           </div>
 
-          <div class="transcript" id="transcript"></div>
+          <div class="transcript-wrap">
+            <div class="transcript" id="transcript"></div>
+            <button id="jumpLatestBtn" class="button jump-latest hidden">Jump to latest</button>
+          </div>
 
           <div class="panel-footer detail-footer">
             <div class="footer-left">
@@ -112,6 +128,8 @@
         </section>
       </main>
     </div>
+
+    <div class="toast hidden" id="toast"></div>
 
     <script src="app.js"></script>
   </body>
