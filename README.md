@@ -33,6 +33,7 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
      - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`: Twilio REST credentials that can control the conference hosting your caller + AI.
      - `HUMAN_AGENT_NUMBER`: PSTN/SIP destination for escalations.
      - `TWILIO_HUMAN_LABEL`: Participant label to use when the helper joins your conference.
+     - `CONTROL_API_TOKEN`: Optional bearer token required by manual control endpoints (`/control/calls/:call_id/*`).
    - Optional Discord transcript streaming:
      - `DISCORD_WEBHOOK_URL`: Discord webhook endpoint for posting live transcripts/notifications.
    - Optional transcription tuning:
@@ -65,6 +66,21 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
 - Accepting a call posts your prompt/voice/metadata via `/v1/realtime/calls/{call_id}/accept`, then connects to the Realtime Calls WebSocket (`wss://api.openai.com/v1/realtime?call_id=...`).
 - The WebSocket handler logs transcripts, greets the caller (if `WELCOME_MESSAGE` is set), and reacts to tool calls (warm transfer, CRM lookups, etc.). Caller and agent utterances are transcribed turn-by-turn; each completed sentence is sent to Discord (if `DISCORD_WEBHOOK_URL` is present) in the form `Caller: ...` / `Agent: ...`. If Twilio credentials + `HUMAN_AGENT_NUMBER` are present, the server registers a `transfer_to_human` tool that automatically dials your teammate via Programmable SIP when the model invokes it.
 - `GET /health` returns `{"status":"ok"}` for uptime checks.
+- Manual operator controls are available from:
+  - `POST /control/calls/:call_id/transfer`
+  - `POST /control/calls/:call_id/hangup`
+  These endpoints operate on the server’s active in-memory call map. If `CONTROL_API_TOKEN` is set, pass `Authorization: Bearer <token>`.
+
+### Cloudflare Worker control proxy (for dashboard actions)
+
+If your dashboard calls the Cloudflare Worker API, configure these Worker secrets/vars so Worker can proxy actions to your ELB-hosted Docker service:
+
+- `CONTROL_API_BASE_URL`: Base URL for this service (for example `https://voice-api.example.com`).
+- `CONTROL_API_TOKEN`: Optional token forwarded as bearer auth to `/control/calls/:call_id/*`.
+- `CONTROL_API_TIMEOUT_MS`: Optional upstream timeout in milliseconds (default `8000`).
+- Optional Cloudflare Access service token headers (if your ELB/API is protected by Access):
+  - `CONTROL_API_ACCESS_CLIENT_ID`
+  - `CONTROL_API_ACCESS_CLIENT_SECRET`
 
 ### Enabling the warm-transfer tool
 

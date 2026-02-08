@@ -20,6 +20,9 @@ const elements = {
   autoScrollToggle: document.getElementById('autoScrollToggle'),
   wsStatus: document.getElementById('wsStatus'),
   reconnectBtn: document.getElementById('reconnectBtn'),
+  transferBtn: document.getElementById('transferBtn'),
+  hangupBtn: document.getElementById('hangupBtn'),
+  actionStatus: document.getElementById('actionStatus'),
   searchInput: document.getElementById('searchInput'),
   exportJson: document.getElementById('exportJson'),
   exportCsv: document.getElementById('exportCsv')
@@ -42,7 +45,8 @@ const state = {
   searchTerm: '',
   autoScroll: true,
   poller: null,
-  reconnectTimer: null
+  reconnectTimer: null,
+  actionInFlight: false
 };
 
 function normalizeBase(value) {
@@ -109,6 +113,21 @@ function setStatus(el, text, variant) {
   }
   el.style.background = '';
   el.style.color = '';
+}
+
+function setActionStatus(text, variant) {
+  setStatus(elements.actionStatus, text, variant);
+}
+
+function isActionableCall(call) {
+  if (!call) return false;
+  return call.status !== 'ended' && call.status !== 'failed';
+}
+
+function refreshActionButtons() {
+  const enabled = Boolean(state.selectedCallId) && isActionableCall(state.callDetail) && !state.actionInFlight;
+  elements.transferBtn.disabled = !enabled;
+  elements.hangupBtn.disabled = !enabled;
 }
 
 async function fetchJson(url) {
@@ -214,6 +233,7 @@ function renderCallMeta() {
       el.textContent = '-';
     });
     elements.callSubtitle.textContent = 'Pick a call to see details.';
+    refreshActionButtons();
     return;
   }
 
@@ -231,6 +251,7 @@ function renderCallMeta() {
   });
 
   elements.callSubtitle.textContent = `Last update: ${formatDateTime(call.updated_at)} | Seq: ${call.last_seq || 0}`;
+  refreshActionButtons();
 }
 
 function clearTranscript() {
@@ -240,6 +261,8 @@ function clearTranscript() {
   elements.transcript.innerHTML = '';
   elements.searchInput.value = '';
   state.searchTerm = '';
+  setActionStatus('Idle');
+  refreshActionButtons();
 }
 
 function applyTranscriptFilter() {
@@ -355,6 +378,63 @@ function handleWsMessage(message) {
       renderCallMeta();
       updateCallInList(message.call_id, { status: message.status, ended_at: message.ended_at });
     }
+  }
+}
+
+async function triggerCallAction(action, payload = {}) {
+  if (!state.selectedCallId || state.actionInFlight) return;
+
+  state.actionInFlight = true;
+  refreshActionButtons();
+  setActionStatus(action === 'transfer' ? 'Transferring...' : 'Ending call...');
+
+  try {
+    const response = await fetch(
+      apiUrl(`/api/calls/${encodeURIComponent(state.selectedCallId)}/actions/${encodeURIComponent(action)}`),
+      {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload || {})
+      }
+    );
+
+    let result = {};
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      result = await response.json().catch(() => ({}));
+    } else {
+      const text = await response.text().catch(() => '');
+      result = text ? { message: text } : {};
+    }
+
+    const errorMessage =
+      result?.error?.message || result?.message || `Action failed (${response.status})`;
+    if (!response.ok || result?.ok === false || result?.status === 'error') {
+      throw new Error(errorMessage);
+    }
+
+    if (action === 'hangup') {
+      const endedAt = Math.floor(Date.now() / 1000);
+      if (!state.callDetail) {
+        state.callDetail = { call_id: state.selectedCallId };
+      }
+      state.callDetail.status = 'ended';
+      state.callDetail.ended_at = endedAt;
+      renderCallMeta();
+      updateCallInList(state.selectedCallId, { status: 'ended', ended_at: endedAt });
+      setActionStatus('Call ended');
+    } else {
+      setActionStatus('Transfer requested');
+    }
+  } catch (err) {
+    setActionStatus('Action failed', 'error');
+    console.error(err);
+  } finally {
+    state.actionInFlight = false;
+    refreshActionButtons();
   }
 }
 
@@ -546,6 +626,21 @@ function init() {
     connectWebSocket();
   });
 
+  elements.transferBtn.addEventListener('click', () => {
+    if (!state.selectedCallId) return;
+    const reason = window.prompt('Optional transfer reason:', '');
+    if (reason === null) return;
+    const payload = reason.trim() ? { reason: reason.trim() } : {};
+    triggerCallAction('transfer', payload);
+  });
+
+  elements.hangupBtn.addEventListener('click', () => {
+    if (!state.selectedCallId) return;
+    const confirmed = window.confirm('End this call now?');
+    if (!confirmed) return;
+    triggerCallAction('hangup');
+  });
+
   elements.searchInput.addEventListener('input', (event) => {
     state.searchTerm = event.target.value.trim().toLowerCase();
     applyTranscriptFilter();
@@ -561,6 +656,8 @@ function init() {
 
   loadCalls({ reset: true });
   startPolling();
+  setActionStatus('Idle');
+  refreshActionButtons();
 
   if (state.selectedCallId) {
     selectCall(state.selectedCallId);

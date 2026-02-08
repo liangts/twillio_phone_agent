@@ -34,6 +34,18 @@ function errorResponse(status, message, code = 'bad_request', details = undefine
   return jsonResponse({ error: { code, message, details } }, status);
 }
 
+function parseTimeoutMs(value, fallback = 8000) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < 1000) return 1000;
+  if (parsed > 30000) return 30000;
+  return Math.floor(parsed);
+}
+
+function getControlBaseUrl(env) {
+  return (env?.CONTROL_API_BASE_URL || '').replace(/\/+$/, '');
+}
+
 async function broadcastToRoom(env, callId, payload) {
   if (!env?.CALL_ROOM || !callId) return;
   const id = env.CALL_ROOM.idFromName(callId);
@@ -179,6 +191,112 @@ async function handleWebSocket(callId, request, env) {
   return stub.fetch(forwarded);
 }
 
+async function handleCallAction(callId, action, request, env) {
+  const controlBase = getControlBaseUrl(env);
+  if (!controlBase) {
+    return errorResponse(
+      503,
+      'Control API is not configured on this Worker',
+      'control_unavailable'
+    );
+  }
+
+  if (action !== 'transfer' && action !== 'hangup') {
+    return errorResponse(404, 'Not found', 'not_found');
+  }
+
+  let payload = {};
+  if ((request.headers.get('content-type') || '').includes('application/json')) {
+    try {
+      payload = await request.json();
+    } catch (_err) {
+      return errorResponse(400, 'Invalid JSON payload');
+    }
+  }
+
+  const controller = new AbortController();
+  const timeoutMs = parseTimeoutMs(env?.CONTROL_API_TIMEOUT_MS, 8000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json'
+    };
+    if (env?.CONTROL_API_TOKEN) {
+      headers.Authorization = `Bearer ${env.CONTROL_API_TOKEN}`;
+    }
+    if (env?.CONTROL_API_ACCESS_CLIENT_ID) {
+      headers['CF-Access-Client-Id'] = env.CONTROL_API_ACCESS_CLIENT_ID;
+    }
+    if (env?.CONTROL_API_ACCESS_CLIENT_SECRET) {
+      headers['CF-Access-Client-Secret'] = env.CONTROL_API_ACCESS_CLIENT_SECRET;
+    }
+
+    const response = await fetch(
+      `${controlBase}/control/calls/${encodeURIComponent(callId)}/${encodeURIComponent(action)}`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload || {}),
+        signal: controller.signal
+      }
+    );
+
+    let responsePayload = null;
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      responsePayload = await response.json().catch(() => null);
+    } else {
+      const text = await response.text().catch(() => '');
+      responsePayload = text ? { message: text } : {};
+    }
+
+    if (!response.ok) {
+      return jsonResponse(
+        responsePayload || {
+          error: {
+            code: 'control_request_failed',
+            message: `Control API failed (${response.status})`
+          }
+        },
+        response.status
+      );
+    }
+
+    if (action === 'hangup') {
+      const endedAt = nowSeconds();
+      await upsertCall(env, {
+        call_id: callId,
+        event: 'status',
+        status: 'ended',
+        ts: endedAt,
+        ended_at: endedAt
+      });
+      await broadcastToRoom(env, callId, {
+        type: 'call.status',
+        call_id: callId,
+        status: 'ended',
+        ended_at: endedAt
+      });
+    }
+
+    return jsonResponse(responsePayload || { ok: true });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      return errorResponse(504, 'Control request timed out', 'control_timeout');
+    }
+    return errorResponse(
+      502,
+      'Failed to reach control API',
+      'control_upstream_error',
+      err?.message || String(err)
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
@@ -202,15 +320,24 @@ export default {
     }
 
     if (segments[0] === 'api' && segments[1] === 'calls') {
-      if (request.method !== 'GET') {
-        return errorResponse(405, 'Method not allowed', 'method_not_allowed');
-      }
       if (segments.length === 2) {
+        if (request.method !== 'GET') {
+          return errorResponse(405, 'Method not allowed', 'method_not_allowed');
+        }
         return handleCallsList(request, env);
       }
       const callId = segments[2];
       if (!callId) {
         return errorResponse(400, 'call_id is required');
+      }
+      if (segments.length === 5 && segments[3] === 'actions') {
+        if (request.method !== 'POST') {
+          return errorResponse(405, 'Method not allowed', 'method_not_allowed');
+        }
+        return handleCallAction(callId, segments[4], request, env);
+      }
+      if (request.method !== 'GET') {
+        return errorResponse(405, 'Method not allowed', 'method_not_allowed');
       }
       if (segments.length === 3) {
         return handleCallDetail(callId, env);

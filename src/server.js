@@ -26,6 +26,7 @@ const INPUT_TRANSCRIPTION_MODEL = process.env.INPUT_TRANSCRIPTION_MODEL || 'gpt-
 const INPUT_TRANSCRIPTION_LANGUAGE = process.env.INPUT_TRANSCRIPTION_LANGUAGE || '';
 const CF_INGEST_BASE_URL = process.env.CF_INGEST_BASE_URL || '';
 const CF_INGEST_TOKEN = process.env.CF_INGEST_TOKEN || '';
+const CONTROL_API_TOKEN = process.env.CONTROL_API_TOKEN || '';
 const INGEST_ENABLED = Boolean(CF_INGEST_BASE_URL && CF_INGEST_TOKEN);
 
 if (!OPENAI_API_KEY) {
@@ -42,12 +43,110 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const app = express();
 
 const activeCalls = new Map();
+const pendingAccepts = new Set();
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
     ? Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     : null;
 
 const toolHandlers = new Map();
+
+function parseBearerToken(header = '') {
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : null;
+}
+
+function requireControlAuth(req, res, next) {
+  if (!CONTROL_API_TOKEN) {
+    return next();
+  }
+  const token = parseBearerToken(req.headers.authorization || '');
+  if (!token || token !== CONTROL_API_TOKEN) {
+    return res.status(401).json({
+      ok: false,
+      error: {
+        code: 'unauthorized',
+        message: 'Unauthorized'
+      }
+    });
+  }
+  return next();
+}
+
+function normalizeDialableNumber(value) {
+  if (!value || typeof value !== 'string') return null;
+  const match = value.match(/\+?\d{7,15}/);
+  return match ? match[0] : null;
+}
+
+async function inviteHumanAgent(call, args = {}) {
+  if (!twilioClient || !HUMAN_AGENT_NUMBER) {
+    return {
+      status: 'error',
+      message: 'Twilio transfer is not configured on this server.'
+    };
+  }
+
+  const conferenceName = call?.conferenceName || args.conferenceName;
+  const callToken = call?.callToken || args.callToken;
+  const callerNumber = normalizeDialableNumber(call?.from) || normalizeDialableNumber(args.from);
+
+  if (!conferenceName || !callToken || !callerNumber) {
+    const missing = [];
+    if (!conferenceName) missing.push('conferenceName');
+    if (!callToken) missing.push('callToken');
+    if (!callerNumber) missing.push('callerNumber');
+    console.error(`transfer_to_human requested but missing metadata: ${missing.join(', ')}`);
+    return {
+      status: 'error',
+      message: 'I tried to add a teammate but could not find the call metadata.'
+    };
+  }
+
+  try {
+    await twilioClient
+      .conferences(conferenceName)
+      .participants.create({
+        from: callerNumber,
+        label: TWILIO_HUMAN_LABEL,
+        to: HUMAN_AGENT_NUMBER,
+        earlyMedia: false,
+        callToken
+      });
+    console.log(`Invited human agent into conference ${conferenceName}`);
+    return {
+      status: 'ok',
+      message:
+        args?.confirmationMessage ||
+        'Bringing a teammate into the call now. Thanks for waiting!'
+    };
+  } catch (err) {
+    console.error('Failed to add human agent via Twilio', err);
+    return {
+      status: 'error',
+      message: 'I could not reach a human agent right now.'
+    };
+  }
+}
+
+async function requestCallHangup(callId) {
+  try {
+    const response = await fetch(
+      `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/hangup`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    const text = await response.text().catch(() => '');
+    return { ok: response.ok, status: response.status, text };
+  } catch (err) {
+    return { ok: false, status: 0, text: err?.message || 'request failed' };
+  }
+}
 
 if (!DISCORD_WEBHOOK_URL) {
   console.log('DISCORD_WEBHOOK_URL is not configured; Discord notifications are disabled.');
@@ -70,48 +169,7 @@ if (twilioClient && HUMAN_AGENT_NUMBER) {
       }
     },
     handler: async (call, args = {}) => {
-      const conferenceName = call.conferenceName || args.conferenceName;
-      const callToken = call.callToken || args.callToken;
-      const callerNumber = call.from || args.from;
-
-      if (!conferenceName || !callToken || !callerNumber) {
-        const missing = [];
-        if (!conferenceName) missing.push('conferenceName');
-        if (!callToken) missing.push('callToken');
-        if (!callerNumber) missing.push('callerNumber');
-        console.error(
-          `transfer_to_human requested but missing metadata: ${missing.join(', ')}`
-        );
-        return {
-          status: 'error',
-          message: 'I tried to add a teammate but could not find the call metadata.'
-        };
-      }
-
-      try {
-        await twilioClient
-          .conferences(conferenceName)
-          .participants.create({
-            from: callerNumber,
-            label: TWILIO_HUMAN_LABEL,
-            to: HUMAN_AGENT_NUMBER,
-            earlyMedia: false,
-            callToken
-          });
-        console.log(`Invited human agent into conference ${conferenceName}`);
-        return {
-          status: 'ok',
-          message:
-            args?.confirmationMessage ||
-            'Bringing a teammate into the call now. Thanks for waiting!'
-        };
-      } catch (err) {
-        console.error('Failed to add human agent via Twilio', err);
-        return {
-          status: 'error',
-          message: 'I could not reach a human agent right now.'
-        };
-      }
+      return inviteHumanAgent(call, args);
     }
   });
 } else {
@@ -692,40 +750,125 @@ async function acceptIncomingCall(callEvent) {
     throw new Error('Incoming call event missing call_id');
   }
 
-  const callState = createCallState(callId, callEvent);
-  activeCalls.set(callId, callState);
-  await sendIngestCall(callState, 'start', { status: 'incoming' });
-
-  const acceptPayload = buildCallAcceptPayload(callEvent);
-  const resp = await fetch(
-    `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(acceptPayload)
-    }
-  );
-
-  if (!resp.ok) {
-    callState.status = 'failed';
-    await sendIngestCall(callState, 'status', { status: 'failed' });
-    activeCalls.delete(callId);
-    const text = await resp.text().catch(() => '');
-    throw new Error(`Failed to accept call ${callId}: ${resp.status} ${resp.statusText} ${text}`);
+  if (activeCalls.has(callId) || pendingAccepts.has(callId)) {
+    console.log(`Skipping duplicate incoming event for call ${callId}`);
+    return;
   }
+  pendingAccepts.add(callId);
 
-  announceIncomingCall(callState);
+  try {
+    const callState = createCallState(callId, callEvent);
+    activeCalls.set(callId, callState);
+    await sendIngestCall(callState, 'start', { status: 'incoming' });
 
-  const wsUrl = resolveWsUrl(callEvent, callId);
-  connectRealtimeSocket(callState, wsUrl);
+    const acceptPayload = buildCallAcceptPayload(callEvent);
+    const resp = await fetch(
+      `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(acceptPayload)
+      }
+    );
+
+    if (!resp.ok) {
+      callState.status = 'failed';
+      await sendIngestCall(callState, 'status', { status: 'failed' });
+      activeCalls.delete(callId);
+      const text = await resp.text().catch(() => '');
+      throw new Error(`Failed to accept call ${callId}: ${resp.status} ${resp.statusText} ${text}`);
+    }
+
+    announceIncomingCall(callState);
+
+    const wsUrl = resolveWsUrl(callEvent, callId);
+    connectRealtimeSocket(callState, wsUrl);
+  } finally {
+    pendingAccepts.delete(callId);
+  }
 }
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
+
+const controlJsonParser = express.json({ type: 'application/json' });
+
+app.post(
+  '/control/calls/:callId/transfer',
+  controlJsonParser,
+  requireControlAuth,
+  async (req, res) => {
+    const callId = req.params.callId;
+    const call = activeCalls.get(callId);
+    if (!call) {
+      return res.status(404).json({
+        ok: false,
+        error: {
+          code: 'call_not_found',
+          message: `Call ${callId} is not active on this server.`
+        }
+      });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = await inviteHumanAgent(call, body);
+    if (result.status !== 'ok') {
+      return res.status(400).json({
+        ok: false,
+        call_id: callId,
+        ...result
+      });
+    }
+
+    if (!body.silent) {
+      sendSystemResponse(call, body.confirmationMessage || result.message);
+    }
+
+    return res.json({
+      ok: true,
+      call_id: callId,
+      ...result
+    });
+  }
+);
+
+app.post(
+  '/control/calls/:callId/hangup',
+  controlJsonParser,
+  requireControlAuth,
+  async (req, res) => {
+    const callId = req.params.callId;
+    const call = activeCalls.get(callId);
+    if (!call) {
+      return res.status(404).json({
+        ok: false,
+        error: {
+          code: 'call_not_found',
+          message: `Call ${callId} is not active on this server.`
+        }
+      });
+    }
+
+    const hangupResult = await requestCallHangup(callId);
+    if (!hangupResult.ok) {
+      console.warn(
+        `OpenAI hangup request returned ${hangupResult.status} for ${callId}: ${hangupResult.text}`
+      );
+    }
+
+    closeActiveCall(callId, 'operator_hangup');
+    return res.json({
+      ok: true,
+      call_id: callId,
+      remote_hangup_ok: hangupResult.ok,
+      remote_status: hangupResult.status
+    });
+  }
+);
 
 app.post(
   '/openai/webhook',
@@ -746,7 +889,6 @@ app.post(
       switch (event.type) {
         case 'realtime.call.incoming':
           await acceptIncomingCall(event);
-          res.set('Authorization', `Bearer ${OPENAI_API_KEY}`);
           return res.sendStatus(200);
         case 'realtime.call.ended':
         case 'realtime.call.disconnected':
