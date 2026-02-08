@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Callboard</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="topbar">
+        <div class="brand">
+          <div class="logo-mark">CB</div>
+          <div>
+            <div class="brand-title">Callboard</div>
+            <div class="brand-subtitle">Live call list + transcript console</div>
+          </div>
+        </div>
+        <div class="controls">
+          <div class="control">
+            <label for="apiBaseInput">API base</label>
+            <input id="apiBaseInput" type="text" placeholder="https://your-worker.workers.dev" />
+          </div>
+          <div class="control">
+            <label for="statusFilter">Status</label>
+            <select id="statusFilter">
+              <option value="live">Live</option>
+              <option value="ended">Ended</option>
+              <option value="all">All</option>
+            </select>
+          </div>
+          <button id="refreshBtn" class="button">Refresh</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel list-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Calls</h2>
+              <p class="muted">Select a call to stream transcripts in real time.</p>
+            </div>
+            <div class="status-pill" id="listStatus">Idle</div>
+          </div>
+          <div id="callsList" class="call-list">
+            <div class="empty-state">No calls loaded yet.</div>
+          </div>
+          <div class="panel-footer">
+            <button id="loadMoreCalls" class="button ghost">Load more</button>
+            <div class="muted" id="listMeta">0 calls</div>
+          </div>
+        </section>
+
+        <section class="panel detail-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Transcript</h2>
+              <p class="muted" id="callSubtitle">Pick a call to see details.</p>
+            </div>
+            <div class="detail-actions">
+              <input id="searchInput" type="text" placeholder="Search transcript" />
+              <button id="exportJson" class="button ghost">Export JSON</button>
+              <button id="exportCsv" class="button ghost">Export CSV</button>
+            </div>
+          </div>
+
+          <div class="call-meta" id="callMeta">
+            <div class="meta-card">
+              <div class="meta-label">Call ID</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">Status</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">From</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">To</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">Started</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">Ended</div>
+              <div class="meta-value">-</div>
+            </div>
+          </div>
+
+          <div class="transcript" id="transcript"></div>
+
+          <div class="panel-footer detail-footer">
+            <div class="footer-left">
+              <button id="loadMoreTranscript" class="button ghost">Load more</button>
+              <label class="toggle">
+                <input id="autoScrollToggle" type="checkbox" checked />
+                <span>Auto-scroll</span>
+              </label>
+            </div>
+            <div class="footer-right">
+              <button id="reconnectBtn" class="button">Reconnect</button>
+              <div class="status-pill" id="wsStatus">Disconnected</div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

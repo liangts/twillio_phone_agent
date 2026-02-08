@@ -378,6 +378,33 @@ DO WebSocket 推荐用 Native DO WebSocket API（支持 hibernation）。([Cloud
 [13]: https://www.twilio.com/docs/iam/access-tokens?utm_source=chatgpt.com "Access Tokens"
 [14]: https://www.twilio.com/docs/voice/sdks/javascript?utm_source=chatgpt.com "Voice JavaScript SDK: Twilio in the browser"
 
+---
+
+# Milestone 3 实做记录（纯看板：列表/详情/实时 transcript）
+
+已新增静态前端目录：`cf-pages/`（用于 Cloudflare Pages 部署）。
+
+## 目录结构
+
+```
+cf-pages/
+  index.html
+  styles.css
+  app.js
+```
+
+## 使用方式
+
+1) Cloudflare Pages 构建输出目录指向 `cf-pages`（无需 build 命令）。
+2) 页面右上角填写 Worker API base，例如：`https://<worker>.workers.dev`
+3) 或在 URL 加 `?api=https://<worker>.workers.dev`，会自动保存到本地缓存。
+
+功能覆盖：
+- Calls 列表（筛选 live/ended）
+- 详情页（call 元数据 + transcript）
+- WebSocket 实时更新（/ws/calls/:call_id）
+- JSON/CSV 导出
+
 下面给你一份“mini RFC / 接口契约”版本（**可以直接丢给 Codex 按规格实现**）。它覆盖：
 
 * Cloudflare Worker API（REST + WebSocket）
