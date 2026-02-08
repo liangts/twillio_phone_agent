@@ -82,6 +82,19 @@ If your dashboard calls the Cloudflare Worker API, configure these Worker secret
   - `CONTROL_API_ACCESS_CLIENT_ID`
   - `CONTROL_API_ACCESS_CLIENT_SECRET`
 
+### React dashboard
+
+The newer dashboard UI lives in `dashboard/` (React + Vite). It can be hosted on Cloudflare Pages or any static host.
+
+```bash
+cd dashboard
+npm install
+npm run build
+npx wrangler pages deploy dist --project-name <your-pages-project>
+```
+
+Set API base at runtime with `?api=https://phone.ocpp.evcheckpoint.net`, or set `VITE_API_BASE` when building.
+
 ### Enabling the transfer tool
 
 1. **Set destination number**  

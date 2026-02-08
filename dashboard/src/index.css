@@ -1,0 +1,34 @@
+:root {
+  font-family: "Avenir Next", "SF Pro Text", "Segoe UI", "Noto Sans", sans-serif;
+  line-height: 1.35;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: #182231;
+  background: #f6f8fb;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-height: 100%;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+}
+
+input,
+select,
+button {
+  font: inherit;
+}
