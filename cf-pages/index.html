@@ -13,7 +13,7 @@
           <div class="logo-mark">CB</div>
           <div>
             <div class="brand-title">Callboard</div>
-            <div class="brand-subtitle">Live call list + transcript console</div>
+            <div class="brand-subtitle">Live calls, outbound launch, template admin</div>
           </div>
         </div>
         <div class="controls">
@@ -43,10 +43,11 @@
           <div class="panel-header">
             <div>
               <h2>Calls</h2>
-              <p class="muted">Select a call to stream transcripts in real time.</p>
+              <p class="muted">Launch outbound AI calls and monitor live transcripts.</p>
             </div>
             <div class="status-pill" id="listStatus">Idle</div>
           </div>
+
           <div class="list-toolbar">
             <input id="callSearchInput" type="text" placeholder="Search phone / call id" />
             <div class="summary-row">
@@ -55,9 +56,92 @@
               <span class="summary-pill" id="endedCount">Ended 0</span>
             </div>
           </div>
+
+          <section class="subpanel" id="outboundPanel">
+            <div class="subpanel-header">
+              <h3>Outbound Launch</h3>
+              <div class="status-pill" id="launchRequestStatus">Idle</div>
+            </div>
+            <div class="subpanel-grid">
+              <label class="control compact" for="launchToInput">
+                <span>Target E.164</span>
+                <input id="launchToInput" type="text" placeholder="+14155550123" />
+              </label>
+              <label class="control compact" for="launchTemplateSelect">
+                <span>Template</span>
+                <select id="launchTemplateSelect"></select>
+              </label>
+            </div>
+            <label class="control compact" for="launchObjectiveInput">
+              <span>Objective Note</span>
+              <textarea id="launchObjectiveInput" rows="3" placeholder="Short purpose for this call"></textarea>
+            </label>
+            <button id="launchSubmitBtn" class="button">Launch Call</button>
+          </section>
+
+          <section class="subpanel">
+            <div class="subpanel-header">
+              <h3>Recent Launches</h3>
+              <button id="refreshLaunchesBtn" class="button ghost small">Refresh</button>
+            </div>
+            <div id="launchesList" class="launch-list">
+              <div class="empty-state">No launches yet.</div>
+            </div>
+          </section>
+
+          <section class="subpanel">
+            <div class="subpanel-header">
+              <h3>Template Admin</h3>
+              <button id="templateResetBtn" class="button ghost small">New</button>
+            </div>
+
+            <div class="template-form">
+              <label class="control compact" for="templateIdInput">
+                <span>Template ID</span>
+                <input id="templateIdInput" type="text" placeholder="appt-reminder" />
+              </label>
+              <label class="control compact" for="templateNameInput">
+                <span>Name</span>
+                <input id="templateNameInput" type="text" placeholder="Appointment Reminder" />
+              </label>
+              <label class="control compact" for="templateDescriptionInput">
+                <span>Description</span>
+                <input id="templateDescriptionInput" type="text" placeholder="Short summary" />
+              </label>
+              <label class="control compact" for="templateVoiceInput">
+                <span>Voice Override</span>
+                <input id="templateVoiceInput" type="text" placeholder="alloy" />
+              </label>
+              <label class="control compact" for="templateModelInput">
+                <span>Model Override</span>
+                <input id="templateModelInput" type="text" placeholder="gpt-realtime" />
+              </label>
+              <label class="control compact" for="templateInstructionsInput">
+                <span>Instruction Block</span>
+                <textarea id="templateInstructionsInput" rows="5" placeholder="Template-specific instructions"></textarea>
+              </label>
+              <div class="template-flags">
+                <label class="toggle inline-toggle">
+                  <input id="templateActiveInput" type="checkbox" checked />
+                  <span>Active</span>
+                </label>
+                <label class="toggle inline-toggle">
+                  <input id="templateDefaultInput" type="checkbox" />
+                  <span>Default</span>
+                </label>
+              </div>
+              <button id="templateSaveBtn" class="button">Save Template</button>
+            </div>
+
+            <div id="templateList" class="template-list">
+              <div class="empty-state">No templates yet.</div>
+            </div>
+          </section>
+
           <div id="callsList" class="call-list">
             <div class="empty-state">No calls loaded yet.</div>
           </div>
+
           <div class="panel-footer">
             <button id="loadMoreCalls" class="button ghost">Load more</button>
             <div class="muted" id="listMeta">0 calls</div>
@@ -84,6 +168,18 @@
             </div>
             <div class="meta-card">
               <div class="meta-label">Status</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">Direction</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">Launch ID</div>
+              <div class="meta-value">-</div>
+            </div>
+            <div class="meta-card">
+              <div class="meta-label">Template ID</div>
               <div class="meta-value">-</div>
             </div>
             <div class="meta-card">

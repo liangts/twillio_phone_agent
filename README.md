@@ -10,6 +10,7 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
 1. Receive webhook events from the OpenAI SIP connector.
 2. Accept incoming calls with the right model/voice/prompt via `POST /v1/realtime/calls/{call_id}/accept`.
 3. Attach to the per-call WebSocket so we can observe transcripts, send system instructions, and react to tool invocations (e.g., warm transfers).
+4. Optionally launch outbound calls by originating Twilio PSTN calls that bridge into OpenAI SIP (`<Dial><Sip>` with `X-Launch-Id`).
 
 ## Getting started
 
@@ -31,9 +32,13 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
    - `PORT`: Local port for the Express server (default `3000`).
    - Optional transfer settings:
      - `HUMAN_AGENT_NUMBER`: PSTN destination in E.164 format (`+15551112222`). The server automatically converts it to `tel:+15551112222` for OpenAI SIP refer transfers.
-     - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`: Optional Twilio REST credentials used only for conference-based transfer fallback flows.
+     - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`: Twilio REST credentials used for conference transfer fallback and outbound launch origination.
      - `TWILIO_HUMAN_LABEL`: Participant label used for Twilio conference fallback transfers.
      - `CONTROL_API_TOKEN`: Optional bearer token required by manual control endpoints (`/control/calls/:call_id/*`).
+   - Optional outbound launch settings:
+     - `TWILIO_OUTBOUND_FROM`: Twilio PSTN caller ID (E.164) used when launching outbound calls.
+     - `OPENAI_SIP_URI`: OpenAI SIP connector URI Twilio should dial in `<Sip>`.
+     - `TWILIO_OUTBOUND_STATUS_CALLBACK_URL`: Public callback URL Twilio will POST call status updates to (for example `https://voice-api.example.com/twilio/outbound/status`).
    - Optional Discord transcript streaming:
      - `DISCORD_WEBHOOK_URL`: Discord webhook endpoint for posting live transcripts/notifications.
    - Optional transcription tuning:
@@ -69,31 +74,36 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
 - Manual operator controls are available from:
   - `POST /control/calls/:call_id/transfer`
   - `POST /control/calls/:call_id/hangup`
+  - `POST /control/outbound/launch`
   These endpoints operate on the server’s active in-memory call map. If `CONTROL_API_TOKEN` is set, pass `Authorization: Bearer <token>`.
+- Twilio launch status callback:
+  - `POST /twilio/outbound/status`
+  Twilio posts `CallSid` + `CallStatus`, and the server forwards status transitions (`launch.queued`, `launch.ringing`, `launch.answered`, `launch.completed`/`launch.failed`) to Cloudflare ingest.
 
 ### Cloudflare Worker control proxy (for dashboard actions)
 
 If your dashboard calls the Cloudflare Worker API, configure these Worker secrets/vars so Worker can proxy actions to your ELB-hosted Docker service:
 
 - `CONTROL_API_BASE_URL`: Base URL for this service (for example `https://voice-api.example.com`).
-- `CONTROL_API_TOKEN`: Optional token forwarded as bearer auth to `/control/calls/:call_id/*`.
+- `CONTROL_API_TOKEN`: Optional token forwarded as bearer auth to `/control/calls/:call_id/*` and `/control/outbound/launch`.
 - `CONTROL_API_TIMEOUT_MS`: Optional upstream timeout in milliseconds (default `8000`).
 - Optional Cloudflare Access service token headers (if your ELB/API is protected by Access):
   - `CONTROL_API_ACCESS_CLIENT_ID`
   - `CONTROL_API_ACCESS_CLIENT_SECRET`
 
-### React dashboard
+### Cloudflare Pages console (`cf-pages`)
 
-The newer dashboard UI lives in `dashboard/` (React + Vite). It can be hosted on Cloudflare Pages or any static host.
+The operator UI for this workflow is the static console in `cf-pages/`. It includes:
+- live calls + transcript view
+- outbound launch form
+- recent launch status list
+- prompt template CRUD/default management
+
+Deploy `cf-pages` directly to Cloudflare Pages as a static directory (no build command required).
 
 ```bash
-cd dashboard
-npm install
-npm run build
-npx wrangler pages deploy dist --project-name <your-pages-project>
+npx wrangler pages deploy cf-pages --project-name <your-pages-project>
 ```
-
-Set API base at runtime with `?api=https://phone.ocpp.evcheckpoint.net`, or set `VITE_API_BASE` when building.
 
 ### Enabling the transfer tool
 

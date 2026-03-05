@@ -100,6 +100,7 @@ body {
 
 .control input,
 .control select,
+.control textarea,
 #searchInput,
 #callSearchInput {
   padding: 10px 12px;
@@ -108,6 +109,7 @@ body {
   background: #fff;
   font-size: 14px;
   min-width: 220px;
+  font-family: inherit;
 }
 
 #searchInput,
@@ -161,6 +163,11 @@ body {
   box-shadow: none;
 }
 
+.button.small {
+  padding: 7px 12px;
+  font-size: 12px;
+}
+
 .hidden {
   display: none !important;
 }
@@ -172,7 +179,7 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+  grid-template-columns: minmax(320px, 460px) minmax(0, 1fr);
   gap: 24px;
   flex: 1;
   min-height: 0;
@@ -207,6 +214,126 @@ body {
   display: grid;
   gap: 10px;
   margin-bottom: 12px;
+}
+
+.subpanel {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.75);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.subpanel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.subpanel-header h3 {
+  margin: 0;
+  font-size: 14px;
+  font-family: 'Space Grotesk', sans-serif;
+}
+
+.subpanel-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.control.compact {
+  gap: 4px;
+  font-size: 11px;
+}
+
+.control.compact input,
+.control.compact select,
+.control.compact textarea {
+  min-width: 0;
+}
+
+#launchObjectiveInput,
+#templateInstructionsInput {
+  resize: vertical;
+}
+
+.launch-list,
+.template-list {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.launch-card,
+.template-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #fff;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.launch-top,
+.template-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.launch-id {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.launch-actions,
+.template-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.template-form {
+  display: grid;
+  gap: 8px;
+}
+
+.template-badges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.inline-toggle {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: #fff;
+}
+
+.template-flags {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.error-text {
+  color: #c63e3e;
+}
+
+.success-pill {
+  color: #1b9a6a;
+}
+
+.warning-pill {
+  color: #9e6d15;
 }
 
 .summary-row {
@@ -515,7 +642,7 @@ body {
   }
 
   .list-panel {
-    height: 38vh;
+    height: auto;
   }
 
   .detail-panel {
@@ -539,6 +666,7 @@ body {
 
   .control input,
   .control select,
+  .control textarea,
   #searchInput,
   #callSearchInput {
     min-width: 160px;
@@ -564,6 +692,11 @@ body {
 
   .call-meta {
     grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+
+  .launch-list,
+  .template-list {
+    max-height: 180px;
   }
 
   .detail-footer .footer-right {

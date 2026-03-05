@@ -4,6 +4,7 @@ const STORAGE_KEY = 'callboard_api_base';
 const DEFAULT_STATUS = 'live';
 const CALLS_PAGE_SIZE = 50;
 const TRANSCRIPT_PAGE_SIZE = 200;
+const LAUNCHES_PAGE_SIZE = 25;
 
 const elements = {
   pageRoot: document.getElementById('pageRoot'),
@@ -35,7 +36,25 @@ const elements = {
   searchInput: document.getElementById('searchInput'),
   exportJson: document.getElementById('exportJson'),
   exportCsv: document.getElementById('exportCsv'),
-  toast: document.getElementById('toast')
+  toast: document.getElementById('toast'),
+  launchToInput: document.getElementById('launchToInput'),
+  launchTemplateSelect: document.getElementById('launchTemplateSelect'),
+  launchObjectiveInput: document.getElementById('launchObjectiveInput'),
+  launchSubmitBtn: document.getElementById('launchSubmitBtn'),
+  launchRequestStatus: document.getElementById('launchRequestStatus'),
+  launchesList: document.getElementById('launchesList'),
+  refreshLaunchesBtn: document.getElementById('refreshLaunchesBtn'),
+  templateList: document.getElementById('templateList'),
+  templateIdInput: document.getElementById('templateIdInput'),
+  templateNameInput: document.getElementById('templateNameInput'),
+  templateDescriptionInput: document.getElementById('templateDescriptionInput'),
+  templateInstructionsInput: document.getElementById('templateInstructionsInput'),
+  templateVoiceInput: document.getElementById('templateVoiceInput'),
+  templateModelInput: document.getElementById('templateModelInput'),
+  templateActiveInput: document.getElementById('templateActiveInput'),
+  templateDefaultInput: document.getElementById('templateDefaultInput'),
+  templateSaveBtn: document.getElementById('templateSaveBtn'),
+  templateResetBtn: document.getElementById('templateResetBtn')
 };
 
 const state = {
@@ -60,12 +79,26 @@ const state = {
   poller: null,
   reconnectTimer: null,
   actionInFlight: false,
-  toastTimer: null
+  toastTimer: null,
+  launches: [],
+  launchesNextCursor: null,
+  isLoadingLaunches: false,
+  launchInFlight: false,
+  templates: [],
+  isLoadingTemplates: false,
+  editingTemplateId: null,
+  selectedTemplateId: null
 };
 
 function normalizeBase(value) {
   if (!value) return '';
   return value.replace(/\/+$/, '');
+}
+
+function normalizeE164(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  return /^\+[1-9]\d{7,14}$/.test(trimmed) ? trimmed : null;
 }
 
 function resolveApiBase() {
@@ -106,19 +139,13 @@ function formatSegmentTime(value) {
   return new Date(ms).toLocaleTimeString();
 }
 
-function formatDuration(seconds) {
-  if (!seconds) return '-';
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins}m ${secs}s`;
-}
-
 function trimUri(value) {
   if (!value) return '-';
-  return value.replace(/^sip:/, '').replace(/^tel:/, '');
+  return String(value).replace(/^sip:/i, '').replace(/^tel:/i, '');
 }
 
 function setStatus(el, text, variant) {
+  if (!el) return;
   el.textContent = text;
   if (variant === 'error') {
     el.style.background = 'rgba(255, 107, 61, 0.15)';
@@ -141,6 +168,10 @@ function setStatus(el, text, variant) {
 
 function setActionStatus(text, variant) {
   setStatus(elements.actionStatus, text, variant);
+}
+
+function setLaunchStatus(text, variant) {
+  setStatus(elements.launchRequestStatus, text, variant);
 }
 
 function showToast(message, variant = 'success', timeoutMs = 2600) {
@@ -245,13 +276,30 @@ function refreshActionButtons() {
   elements.hangupBtn.disabled = !enabled;
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { headers: { Accept: 'application/json' } });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
+async function fetchJson(url, init) {
+  const response = await fetch(url, {
+    ...(init || {}),
+    headers: {
+      Accept: 'application/json',
+      ...(init?.headers || {})
+    }
+  });
+
+  const contentType = response.headers.get('content-type') || '';
+  let payload = null;
+  if (contentType.includes('application/json')) {
+    payload = await response.json().catch(() => null);
+  } else {
+    const text = await response.text().catch(() => '');
+    payload = text ? { message: text } : {};
   }
-  return response.json();
+
+  if (!response.ok) {
+    const errMsg = payload?.error?.message || payload?.message || `Request failed: ${response.status}`;
+    throw new Error(errMsg);
+  }
+
+  return payload;
 }
 
 function renderCalls(reset) {
@@ -287,12 +335,14 @@ function renderCalls(reset) {
 
     const metaLine = document.createElement('div');
     metaLine.className = 'meta-line';
-    metaLine.textContent = `Started ${formatDateTime(call.started_at)}`;
+    const direction = call.direction ? ` · ${call.direction}` : '';
+    metaLine.textContent = `Started ${formatDateTime(call.started_at)}${direction}`;
 
     const timeLine = document.createElement('div');
     timeLine.className = 'meta-line';
     const updatedAt = call.updated_at || call.started_at;
-    timeLine.textContent = `Updated ${formatDateTime(updatedAt)}`;
+    const launchSuffix = call.launch_id ? ` · launch ${call.launch_id}` : '';
+    timeLine.textContent = `Updated ${formatDateTime(updatedAt)}${launchSuffix}`;
 
     card.appendChild(badge);
     card.appendChild(title);
@@ -304,6 +354,226 @@ function renderCalls(reset) {
   elements.callsList.innerHTML = '';
   elements.callsList.appendChild(fragment);
   elements.listMeta.textContent = `${filteredCalls.length} shown · ${state.calls.length} total`;
+}
+
+function renderLaunches() {
+  const launches = state.launches || [];
+  if (!launches.length) {
+    elements.launchesList.innerHTML = '<div class="empty-state">No launches yet.</div>';
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const launch of launches) {
+    const card = document.createElement('div');
+    card.className = 'launch-card';
+
+    const top = document.createElement('div');
+    top.className = 'launch-top';
+
+    const status = document.createElement('span');
+    status.className = `badge ${launch.status || 'unknown'}`;
+    status.textContent = launch.status || 'unknown';
+
+    const id = document.createElement('span');
+    id.className = 'launch-id';
+    id.textContent = launch.launch_id;
+
+    top.appendChild(status);
+    top.appendChild(id);
+
+    const target = document.createElement('div');
+    target.className = 'meta-line';
+    target.textContent = `Target ${trimUri(launch.target_e164)}`;
+
+    const template = document.createElement('div');
+    template.className = 'meta-line';
+    template.textContent = `Template ${launch.template_id || '-'}`;
+
+    const updated = document.createElement('div');
+    updated.className = 'meta-line';
+    updated.textContent = `Updated ${formatDateTime(launch.updated_at)}`;
+
+    const actionRow = document.createElement('div');
+    actionRow.className = 'launch-actions';
+
+    if (launch.openai_call_id) {
+      const openBtn = document.createElement('button');
+      openBtn.className = 'button ghost small';
+      openBtn.textContent = 'Open Call';
+      openBtn.dataset.openCallId = launch.openai_call_id;
+      actionRow.appendChild(openBtn);
+    }
+
+    if (launch.error_message) {
+      const err = document.createElement('div');
+      err.className = 'meta-line error-text';
+      err.textContent = launch.error_message;
+      actionRow.appendChild(err);
+    }
+
+    card.appendChild(top);
+    card.appendChild(target);
+    card.appendChild(template);
+    card.appendChild(updated);
+    if (actionRow.childNodes.length) {
+      card.appendChild(actionRow);
+    }
+
+    fragment.appendChild(card);
+  }
+
+  elements.launchesList.innerHTML = '';
+  elements.launchesList.appendChild(fragment);
+}
+
+function renderTemplateOptions() {
+  const select = elements.launchTemplateSelect;
+  const templates = state.templates.filter((item) => Number(item.is_active) === 1);
+
+  select.innerHTML = '';
+  if (!templates.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No active templates';
+    select.appendChild(option);
+    state.selectedTemplateId = null;
+    return;
+  }
+
+  const preferred =
+    state.selectedTemplateId && templates.find((item) => item.template_id === state.selectedTemplateId)
+      ? state.selectedTemplateId
+      : (templates.find((item) => Number(item.is_default) === 1)?.template_id || templates[0].template_id);
+
+  state.selectedTemplateId = preferred;
+
+  for (const template of templates) {
+    const option = document.createElement('option');
+    option.value = template.template_id;
+    const suffix = Number(template.is_default) === 1 ? ' (default)' : '';
+    option.textContent = `${template.name}${suffix}`;
+    if (template.template_id === preferred) {
+      option.selected = true;
+    }
+    select.appendChild(option);
+  }
+}
+
+function renderTemplateList() {
+  const templates = state.templates || [];
+  if (!templates.length) {
+    elements.templateList.innerHTML = '<div class="empty-state">No templates yet.</div>';
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const template of templates) {
+    const card = document.createElement('div');
+    card.className = 'template-card';
+
+    const top = document.createElement('div');
+    top.className = 'template-top';
+
+    const title = document.createElement('strong');
+    title.textContent = template.name;
+
+    const badges = document.createElement('div');
+    badges.className = 'template-badges';
+
+    const idBadge = document.createElement('span');
+    idBadge.className = 'summary-pill';
+    idBadge.textContent = template.template_id;
+    badges.appendChild(idBadge);
+
+    const activeBadge = document.createElement('span');
+    activeBadge.className = `summary-pill ${Number(template.is_active) ? 'success-pill' : 'warning-pill'}`;
+    activeBadge.textContent = Number(template.is_active) ? 'active' : 'inactive';
+    badges.appendChild(activeBadge);
+
+    if (Number(template.is_default) === 1) {
+      const defaultBadge = document.createElement('span');
+      defaultBadge.className = 'summary-pill';
+      defaultBadge.textContent = 'default';
+      badges.appendChild(defaultBadge);
+    }
+
+    top.appendChild(title);
+    top.appendChild(badges);
+
+    const desc = document.createElement('div');
+    desc.className = 'meta-line';
+    desc.textContent = template.description || 'No description';
+
+    const actions = document.createElement('div');
+    actions.className = 'template-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'button ghost small';
+    editBtn.textContent = 'Edit';
+    editBtn.dataset.templateId = template.template_id;
+    editBtn.dataset.action = 'edit';
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'button ghost small';
+    toggleBtn.textContent = Number(template.is_active) ? 'Deactivate' : 'Activate';
+    toggleBtn.dataset.templateId = template.template_id;
+    toggleBtn.dataset.action = Number(template.is_active) ? 'deactivate' : 'activate';
+
+    const defaultBtn = document.createElement('button');
+    defaultBtn.className = 'button ghost small';
+    defaultBtn.textContent = 'Set default';
+    defaultBtn.dataset.templateId = template.template_id;
+    defaultBtn.dataset.action = 'default';
+    defaultBtn.disabled = Number(template.is_default) === 1;
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'button ghost small';
+    deleteBtn.textContent = 'Delete';
+    deleteBtn.dataset.templateId = template.template_id;
+    deleteBtn.dataset.action = 'delete';
+
+    actions.appendChild(editBtn);
+    actions.appendChild(toggleBtn);
+    actions.appendChild(defaultBtn);
+    actions.appendChild(deleteBtn);
+
+    card.appendChild(top);
+    card.appendChild(desc);
+    card.appendChild(actions);
+    fragment.appendChild(card);
+  }
+
+  elements.templateList.innerHTML = '';
+  elements.templateList.appendChild(fragment);
+}
+
+function clearTemplateForm() {
+  state.editingTemplateId = null;
+  elements.templateIdInput.value = '';
+  elements.templateNameInput.value = '';
+  elements.templateDescriptionInput.value = '';
+  elements.templateInstructionsInput.value = '';
+  elements.templateVoiceInput.value = '';
+  elements.templateModelInput.value = '';
+  elements.templateActiveInput.checked = true;
+  elements.templateDefaultInput.checked = false;
+  elements.templateIdInput.disabled = false;
+  elements.templateSaveBtn.textContent = 'Save Template';
+}
+
+function fillTemplateForm(template) {
+  state.editingTemplateId = template.template_id;
+  elements.templateIdInput.value = template.template_id;
+  elements.templateNameInput.value = template.name || '';
+  elements.templateDescriptionInput.value = template.description || '';
+  elements.templateInstructionsInput.value = template.instruction_block || '';
+  elements.templateVoiceInput.value = template.voice_override || '';
+  elements.templateModelInput.value = template.model_override || '';
+  elements.templateActiveInput.checked = Number(template.is_active) === 1;
+  elements.templateDefaultInput.checked = Number(template.is_default) === 1;
+  elements.templateIdInput.disabled = true;
+  elements.templateSaveBtn.textContent = 'Update Template';
 }
 
 async function loadCalls({ reset }) {
@@ -334,9 +604,50 @@ async function loadCalls({ reset }) {
   } catch (err) {
     setStatus(elements.listStatus, 'Error', 'error');
     elements.listMeta.textContent = 'Failed to load calls.';
-    console.error(err);
+    showToast(err?.message || 'Failed to load calls.', 'error');
   } finally {
     state.isLoadingCalls = false;
+  }
+}
+
+async function loadLaunches({ reset }) {
+  if (state.isLoadingLaunches) return;
+  state.isLoadingLaunches = true;
+
+  try {
+    let url = apiUrl(`/api/outbound/launches?limit=${LAUNCHES_PAGE_SIZE}`);
+    if (!reset && state.launchesNextCursor) {
+      url += `&cursor=${encodeURIComponent(state.launchesNextCursor)}`;
+    }
+
+    const data = await fetchJson(url);
+    if (reset) {
+      state.launches = data.items || [];
+    } else {
+      state.launches = state.launches.concat(data.items || []);
+    }
+    state.launchesNextCursor = data.next_cursor || null;
+    renderLaunches();
+  } catch (err) {
+    showToast(err?.message || 'Failed to load launches.', 'error');
+  } finally {
+    state.isLoadingLaunches = false;
+  }
+}
+
+async function loadTemplates() {
+  if (state.isLoadingTemplates) return;
+  state.isLoadingTemplates = true;
+
+  try {
+    const data = await fetchJson(apiUrl('/api/outbound/templates?include_inactive=1'));
+    state.templates = data.items || [];
+    renderTemplateOptions();
+    renderTemplateList();
+  } catch (err) {
+    showToast(err?.message || 'Failed to load templates.', 'error');
+  } finally {
+    state.isLoadingTemplates = false;
   }
 }
 
@@ -361,6 +672,9 @@ function renderCallMeta() {
   const values = [
     call.call_id,
     call.status || 'unknown',
+    call.direction || 'inbound',
+    call.launch_id || '-',
+    call.template_id || '-',
     trimUri(call.from_uri),
     trimUri(call.to_uri),
     formatDateTime(call.started_at),
@@ -437,7 +751,6 @@ function appendSegments(segments) {
   }
 
   elements.transcript.appendChild(fragment);
-
   applyTranscriptFilter();
 
   if (state.autoScroll && shouldScroll) {
@@ -463,7 +776,7 @@ async function loadTranscriptPage(afterSeq) {
     const expectedLast = data.last_seq || state.lastSeq;
     elements.loadMoreTranscript.disabled = state.lastSeq >= expectedLast;
   } catch (err) {
-    console.error(err);
+    showToast(err?.message || 'Failed to load transcript.', 'error');
   } finally {
     state.isLoadingTranscript = false;
   }
@@ -494,7 +807,10 @@ function handleWsMessage(message) {
     if (state.callDetail) {
       state.callDetail.last_seq = Math.max(state.callDetail.last_seq || 0, message.segment.seq || 0);
       renderCallMeta();
-      updateCallInList(state.selectedCallId, { last_seq: state.callDetail.last_seq, updated_at: Math.floor(Date.now() / 1000) });
+      updateCallInList(state.selectedCallId, {
+        last_seq: state.callDetail.last_seq,
+        updated_at: Math.floor(Date.now() / 1000)
+      });
     }
     return;
   }
@@ -519,31 +835,19 @@ async function triggerCallAction(action, payload = {}) {
   setActionStatus(action === 'transfer' ? 'Transferring...' : 'Ending call...', 'warning');
 
   try {
-    const response = await fetch(
+    const result = await fetchJson(
       apiUrl(`/api/calls/${encodeURIComponent(state.selectedCallId)}/actions/${encodeURIComponent(action)}`),
       {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload || {})
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload || {})
       }
     );
 
-    let result = {};
-    const contentType = response.headers.get('content-type') || '';
-    if (contentType.includes('application/json')) {
-      result = await response.json().catch(() => ({}));
-    } else {
-      const text = await response.text().catch(() => '');
-      result = text ? { message: text } : {};
-    }
-
-    const errorMessage =
-      result?.error?.message || result?.message || `Action failed (${response.status})`;
-    if (!response.ok || result?.ok === false || result?.status === 'error') {
-      throw new Error(errorMessage);
+    if (result?.ok === false || result?.status === 'error') {
+      throw new Error(result?.error?.message || result?.message || 'Action failed');
     }
 
     if (action === 'hangup') {
@@ -564,10 +868,152 @@ async function triggerCallAction(action, payload = {}) {
   } catch (err) {
     setActionStatus('Action failed', 'error');
     showToast(err?.message || 'Action failed.', 'error', 3200);
-    console.error(err);
   } finally {
     state.actionInFlight = false;
     refreshActionButtons();
+  }
+}
+
+async function triggerOutboundLaunch() {
+  if (state.launchInFlight) return;
+  const to = normalizeE164(elements.launchToInput.value);
+  if (!to) {
+    showToast('Target must be E.164 format, e.g. +14155550123.', 'error', 3000);
+    return;
+  }
+
+  const templateId = elements.launchTemplateSelect.value || null;
+  if (!templateId) {
+    showToast('Select an active template before launching.', 'error', 3000);
+    return;
+  }
+
+  state.launchInFlight = true;
+  elements.launchSubmitBtn.disabled = true;
+  setLaunchStatus('Launching...', 'warning');
+
+  try {
+    const payload = {
+      to,
+      template_id: templateId,
+      objective_note: elements.launchObjectiveInput.value.trim() || null
+    };
+
+    const response = await fetchJson(apiUrl('/api/outbound/launches'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const launchId = response?.launch?.launch_id || response?.launch_id || 'new launch';
+    setLaunchStatus('Queued', 'success');
+    showToast(`Launch ${launchId} queued.`, 'success');
+
+    elements.launchObjectiveInput.value = '';
+    await loadLaunches({ reset: true });
+    await loadCalls({ reset: true });
+  } catch (err) {
+    setLaunchStatus('Failed', 'error');
+    showToast(err?.message || 'Failed to launch outbound call.', 'error', 3200);
+  } finally {
+    state.launchInFlight = false;
+    elements.launchSubmitBtn.disabled = false;
+  }
+}
+
+function collectTemplatePayload() {
+  const templateId = elements.templateIdInput.value.trim();
+  const name = elements.templateNameInput.value.trim();
+  const instructionBlock = elements.templateInstructionsInput.value.trim();
+
+  if (!templateId && !state.editingTemplateId) {
+    throw new Error('Template ID is required.');
+  }
+  if (!name) {
+    throw new Error('Template name is required.');
+  }
+  if (!instructionBlock) {
+    throw new Error('Instruction block is required.');
+  }
+
+  return {
+    template_id: templateId,
+    name,
+    description: elements.templateDescriptionInput.value.trim() || null,
+    instruction_block: instructionBlock,
+    voice_override: elements.templateVoiceInput.value.trim() || null,
+    model_override: elements.templateModelInput.value.trim() || null,
+    is_active: elements.templateActiveInput.checked,
+    is_default: elements.templateDefaultInput.checked
+  };
+}
+
+async function saveTemplate() {
+  let payload;
+  try {
+    payload = collectTemplatePayload();
+  } catch (err) {
+    showToast(err?.message || 'Invalid template payload.', 'error', 3200);
+    return;
+  }
+
+  elements.templateSaveBtn.disabled = true;
+
+  try {
+    if (state.editingTemplateId) {
+      const updatePayload = { ...payload };
+      delete updatePayload.template_id;
+      await fetchJson(apiUrl(`/api/outbound/templates/${encodeURIComponent(state.editingTemplateId)}`), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatePayload)
+      });
+      showToast('Template updated.', 'success');
+    } else {
+      await fetchJson(apiUrl('/api/outbound/templates'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      showToast('Template created.', 'success');
+    }
+
+    await loadTemplates();
+    clearTemplateForm();
+  } catch (err) {
+    showToast(err?.message || 'Failed to save template.', 'error', 3200);
+  } finally {
+    elements.templateSaveBtn.disabled = false;
+  }
+}
+
+async function updateTemplate(templateId, payload, successMessage) {
+  await fetchJson(apiUrl(`/api/outbound/templates/${encodeURIComponent(templateId)}`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (successMessage) {
+    showToast(successMessage, 'success');
+  }
+  await loadTemplates();
+}
+
+async function deleteTemplate(templateId) {
+  const confirmed = window.confirm(`Delete template ${templateId}?`);
+  if (!confirmed) return;
+
+  try {
+    await fetchJson(apiUrl(`/api/outbound/templates/${encodeURIComponent(templateId)}`), {
+      method: 'DELETE'
+    });
+    showToast('Template deleted.', 'success');
+    if (state.editingTemplateId === templateId) {
+      clearTemplateForm();
+    }
+    await loadTemplates();
+  } catch (err) {
+    showToast(err?.message || 'Failed to delete template.', 'error', 3200);
   }
 }
 
@@ -659,8 +1105,8 @@ async function selectCall(callId) {
     await loadTranscriptPage(0);
     connectWebSocket();
   } catch (err) {
-    console.error(err);
     elements.callSubtitle.textContent = 'Failed to load call details.';
+    showToast(err?.message || 'Failed to load call details.', 'error');
   }
 }
 
@@ -700,6 +1146,7 @@ function startPolling() {
   if (state.poller) clearInterval(state.poller);
   state.poller = setInterval(() => {
     loadCalls({ reset: true });
+    loadLaunches({ reset: true });
   }, 5000);
 }
 
@@ -727,6 +1174,8 @@ function init() {
       localStorage.setItem(STORAGE_KEY, value);
       state.apiBase = value;
       loadCalls({ reset: true });
+      loadLaunches({ reset: true });
+      loadTemplates();
       if (state.selectedCallId) {
         selectCall(state.selectedCallId);
       }
@@ -760,6 +1209,16 @@ function init() {
     if (!card) return;
     const callId = card.dataset.callId;
     if (callId) selectCall(callId);
+  });
+
+  elements.launchesList.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-open-call-id]');
+    if (!button) return;
+    const callId = button.dataset.openCallId;
+    if (callId) {
+      selectCall(callId);
+      showToast(`Opening call ${callId}`, 'success', 1400);
+    }
   });
 
   elements.loadMoreCalls.addEventListener('click', () => {
@@ -820,6 +1279,66 @@ function init() {
     exportTranscript('csv');
   });
 
+  elements.launchTemplateSelect.addEventListener('change', (event) => {
+    state.selectedTemplateId = event.target.value || null;
+  });
+
+  elements.launchSubmitBtn.addEventListener('click', () => {
+    triggerOutboundLaunch();
+  });
+
+  elements.refreshLaunchesBtn.addEventListener('click', () => {
+    loadLaunches({ reset: true });
+  });
+
+  elements.templateSaveBtn.addEventListener('click', () => {
+    saveTemplate();
+  });
+
+  elements.templateResetBtn.addEventListener('click', () => {
+    clearTemplateForm();
+  });
+
+  elements.templateList.addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-template-id]');
+    if (!button) return;
+
+    const templateId = button.dataset.templateId;
+    const action = button.dataset.action;
+    if (!templateId || !action) return;
+
+    const template = state.templates.find((item) => item.template_id === templateId);
+    if (!template) return;
+
+    try {
+      if (action === 'edit') {
+        fillTemplateForm(template);
+        return;
+      }
+
+      if (action === 'delete') {
+        await deleteTemplate(templateId);
+        return;
+      }
+
+      if (action === 'default') {
+        await updateTemplate(templateId, { is_default: true, is_active: true }, 'Default template updated.');
+        return;
+      }
+
+      if (action === 'activate') {
+        await updateTemplate(templateId, { is_active: true }, 'Template activated.');
+        return;
+      }
+
+      if (action === 'deactivate') {
+        await updateTemplate(templateId, { is_active: false }, 'Template deactivated.');
+      }
+    } catch (err) {
+      showToast(err?.message || 'Template action failed.', 'error', 3200);
+    }
+  });
+
   window.addEventListener('resize', () => {
     applyMobileViewClass();
   });
@@ -844,11 +1363,15 @@ function init() {
   });
 
   loadCalls({ reset: true });
+  loadLaunches({ reset: true });
+  loadTemplates();
   startPolling();
   setActionStatus('Idle');
+  setLaunchStatus('Idle');
   refreshActionButtons();
   updateCallSummary();
   applyMobileViewClass();
+  clearTemplateForm();
 
   if (state.selectedCallId) {
     selectCall(state.selectedCallId);

@@ -21,6 +21,9 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const HUMAN_AGENT_NUMBER = process.env.HUMAN_AGENT_NUMBER;
 const TWILIO_HUMAN_LABEL = process.env.TWILIO_HUMAN_LABEL || 'human agent';
+const TWILIO_OUTBOUND_FROM = process.env.TWILIO_OUTBOUND_FROM || '';
+const OPENAI_SIP_URI = process.env.OPENAI_SIP_URI || '';
+const TWILIO_OUTBOUND_STATUS_CALLBACK_URL = process.env.TWILIO_OUTBOUND_STATUS_CALLBACK_URL || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const INPUT_TRANSCRIPTION_MODEL = process.env.INPUT_TRANSCRIPTION_MODEL || 'gpt-4o-mini-transcribe';
 const INPUT_TRANSCRIPTION_LANGUAGE = process.env.INPUT_TRANSCRIPTION_LANGUAGE || '';
@@ -77,6 +80,31 @@ function normalizeDialableNumber(value) {
   if (!value || typeof value !== 'string') return null;
   const match = value.match(/\+?\d{7,15}/);
   return match ? match[0] : null;
+}
+
+function normalizeE164(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return /^\+[1-9]\d{7,14}$/.test(trimmed) ? trimmed : null;
+}
+
+function escapeXml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function buildSipUriWithLaunchId(baseUri, launchId) {
+  if (!baseUri || !launchId) return null;
+  const separator = baseUri.includes('?') ? '&' : '?';
+  return `${baseUri}${separator}X-Launch-Id=${encodeURIComponent(launchId)}`;
+}
+
+function buildOutboundTwiml(sipUri) {
+  return `<Response><Dial answerOnBridge=\"true\"><Sip>${escapeXml(sipUri)}</Sip></Dial></Response>`;
 }
 
 function normalizeReferTargetUri(value) {
@@ -230,12 +258,30 @@ async function requestCallHangup(callId) {
   }
 }
 
+function mapTwilioCallStatusToOutboundEvent(status = '') {
+  const lower = String(status || '').toLowerCase();
+  if (lower === 'initiated' || lower === 'queued') return 'launch.queued';
+  if (lower === 'ringing') return 'launch.ringing';
+  if (lower === 'in-progress') return 'launch.answered';
+  if (lower === 'completed') return 'launch.completed';
+  if (lower === 'busy' || lower === 'failed' || lower === 'no-answer' || lower === 'canceled') {
+    return 'launch.failed';
+  }
+  return null;
+}
+
 if (!DISCORD_WEBHOOK_URL) {
   console.log('DISCORD_WEBHOOK_URL is not configured; Discord notifications are disabled.');
 }
 
 if (!INGEST_ENABLED) {
   console.log('Cloudflare ingest is disabled (missing CF_INGEST_BASE_URL or CF_INGEST_TOKEN).');
+}
+
+if (!TWILIO_OUTBOUND_FROM || !OPENAI_SIP_URI || !TWILIO_OUTBOUND_STATUS_CALLBACK_URL) {
+  console.log(
+    'Outbound launch is partially configured. Set TWILIO_OUTBOUND_FROM, OPENAI_SIP_URI, and TWILIO_OUTBOUND_STATUS_CALLBACK_URL to enable call launch.'
+  );
 }
 
 if (HUMAN_AGENT_NUMBER) {
@@ -287,10 +333,17 @@ function loadPrompt() {
   }
 }
 
-function buildCallAcceptPayload(callEvent) {
-  const instructions = loadPrompt();
-  const from = callEvent?.data?.from?.number || callEvent?.data?.from || 'unknown';
-  const to = callEvent?.data?.to?.number || callEvent?.data?.to || 'unknown';
+function buildCallAcceptPayload(callEvent, options = {}) {
+  const launchContext = options.launchContext || null;
+  const baseInstructions = loadPrompt();
+  const instructionParts = [baseInstructions];
+  if (launchContext?.instruction_block) {
+    instructionParts.push(String(launchContext.instruction_block).trim());
+  }
+  if (launchContext?.objective_note) {
+    instructionParts.push(`Objective:\n${String(launchContext.objective_note).trim()}`);
+  }
+  const instructions = instructionParts.filter(Boolean).join('\n\n');
   const tools = getToolDefinitions();
   const transcription =
     INPUT_TRANSCRIPTION_MODEL
@@ -302,7 +355,7 @@ function buildCallAcceptPayload(callEvent) {
 
   const audioConfig = {
     output: {
-      voice: OPENAI_VOICE
+      voice: launchContext?.voice_override || OPENAI_VOICE
     }
   };
 
@@ -314,7 +367,7 @@ function buildCallAcceptPayload(callEvent) {
 
   return {
     type: 'realtime',
-    model: OPENAI_MODEL,
+    model: launchContext?.model_override || OPENAI_MODEL,
     instructions,
     output_modalities: ['audio'],
     audio: audioConfig,
@@ -344,12 +397,24 @@ function getNumberFromHeader(value) {
   return match ? match[0] : null;
 }
 
-function createCallState(callId, callEvent) {
+function extractLaunchIdFromCallEvent(callEvent) {
+  const sipHeaders = callEvent?.data?.sip_headers || [];
+  const launchHeader = getSipHeaderValue(sipHeaders, 'x-launch-id');
+  return (
+    launchHeader ||
+    callEvent?.data?.metadata?.launch_id ||
+    callEvent?.data?.launch_id ||
+    null
+  );
+}
+
+function createCallState(callId, callEvent, launchContext = null) {
   const sipHeaders = callEvent?.data?.sip_headers || [];
   const rawFromHeader = getSipHeaderValue(sipHeaders, 'from');
   const rawToHeader = getSipHeaderValue(sipHeaders, 'to');
   const rawDiversionHeader = getSipHeaderValue(sipHeaders, 'diversion');
   const rawHistoryInfoHeader = getSipHeaderValue(sipHeaders, 'history-info');
+  const rawLaunchIdHeader = getSipHeaderValue(sipHeaders, 'x-launch-id');
 
   const forwardedHeader = rawDiversionHeader || rawHistoryInfoHeader || null;
   const forwardedFromNumber = getNumberFromHeader(forwardedHeader);
@@ -373,6 +438,9 @@ function createCallState(callId, callEvent) {
     callEvent?.data?.metadata?.call_token ||
     null;
   const conferenceName = extractConferenceName(callEvent);
+  const launchId = launchContext?.launch_id || rawLaunchIdHeader || callEvent?.data?.launch_id || null;
+  const templateId = launchContext?.template_id || null;
+  const direction = launchId ? 'outbound' : 'inbound';
 
   return {
     callId,
@@ -381,6 +449,10 @@ function createCallState(callId, callEvent) {
     callToken,
     conferenceName,
     provider: callEvent?.data?.provider || (callEvent?.data?.twilio ? 'twilio' : null),
+    launchId,
+    templateId,
+    direction,
+    launchContext,
     ws: null,
     transcripts: {
       caller: [],
@@ -398,6 +470,7 @@ function createCallState(callId, callEvent) {
     rawToHeader,
     rawDiversionHeader,
     rawHistoryInfoHeader,
+    rawLaunchIdHeader,
     forwardedFrom: forwardedFromNumber || forwardedHeader || null
   };
 }
@@ -460,6 +533,41 @@ async function sendIngestRequest(pathname, payload) {
   }
 }
 
+async function sendIngestOutbound(event, payload = {}) {
+  if (!INGEST_ENABLED) return;
+  await sendIngestRequest('/ingest/outbound', {
+    event,
+    ts: Math.floor(Date.now() / 1000),
+    ...payload
+  });
+}
+
+async function fetchOutboundLaunchContext(launchId) {
+  if (!launchId || !INGEST_ENABLED) return null;
+  try {
+    const response = await fetch(
+      buildIngestUrl(`/internal/outbound/launches/${encodeURIComponent(launchId)}/context`),
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${CF_INGEST_TOKEN}`,
+          Accept: 'application/json'
+        }
+      }
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      console.warn(`Launch context fetch failed for ${launchId}`, response.status, text);
+      return null;
+    }
+    const payload = await response.json().catch(() => null);
+    return payload?.context || null;
+  } catch (err) {
+    console.warn(`Launch context request failed for ${launchId}`, err?.message || err);
+    return null;
+  }
+}
+
 function buildCallPayload(call, overrides = {}) {
   const ts = overrides.ts || Math.floor(Date.now() / 1000);
   const baseMeta = {
@@ -468,7 +576,8 @@ function buildCallPayload(call, overrides = {}) {
       from: call.rawFromHeader || null,
       to: call.rawToHeader || null,
       diversion: call.rawDiversionHeader || null,
-      history_info: call.rawHistoryInfoHeader || null
+      history_info: call.rawHistoryInfoHeader || null,
+      launch_id: call.rawLaunchIdHeader || null
     }
   };
   const { meta: overrideMeta, ...restOverrides } = overrides;
@@ -481,6 +590,9 @@ function buildCallPayload(call, overrides = {}) {
     provider: call.provider,
     conference_name: call.conferenceName,
     call_token: call.callToken,
+    launch_id: call.launchId || null,
+    template_id: call.templateId || null,
+    direction: call.direction || null,
     meta: { ...baseMeta, ...(overrideMeta || {}) },
     ...restOverrides
   };
@@ -516,6 +628,18 @@ function markCallEnded(call, reason) {
     ts: Math.floor(call.endedAt / 1000),
     meta: { ...(call.meta || {}), reason }
   }).catch(() => {});
+  if (call.launchId) {
+    const outboundEvent = reason === 'socket_error' ? 'launch.failed' : 'launch.completed';
+    sendIngestOutbound(outboundEvent, {
+      launch_id: call.launchId,
+      openai_call_id: call.callId,
+      status: outboundEvent === 'launch.failed' ? 'failed' : 'completed',
+      ended_at: Math.floor(call.endedAt / 1000),
+      reason,
+      error_code: outboundEvent === 'launch.failed' ? 'socket_error' : null,
+      error_message: outboundEvent === 'launch.failed' ? 'Realtime socket error' : null
+    }).catch(() => {});
+  }
 }
 
 function sendSystemResponse(call, instructions) {
@@ -580,6 +704,14 @@ function recordTranscriptLine(call, speaker, text) {
 function announceIncomingCall(call) {
   if (!call) return;
   const lines = [`Call ${call.callId} accepted.`];
+
+  if (call.launchId) {
+    lines.push(`Launch: ${call.launchId}`);
+  }
+
+  if (call.templateId) {
+    lines.push(`Template: ${call.templateId}`);
+  }
 
   if (call.conferenceName) {
     lines.push(`Conference: ${call.conferenceName}`);
@@ -805,6 +937,13 @@ function connectRealtimeSocket(call, wsUrl) {
       console.log(`Realtime socket open for call ${call.callId}`);
       call.status = 'live';
       sendIngestCall(call, 'status', { status: 'live' }).catch(() => {});
+      if (call.launchId) {
+        sendIngestOutbound('launch.openai_live', {
+          launch_id: call.launchId,
+          openai_call_id: call.callId,
+          status: 'openai_live'
+        }).catch(() => {});
+      }
       if (WELCOME_MESSAGE) {
         const message = {
           type: 'response.create',
@@ -844,11 +983,32 @@ async function acceptIncomingCall(callEvent) {
   pendingAccepts.add(callId);
 
   try {
-    const callState = createCallState(callId, callEvent);
+    const launchIdFromEvent = extractLaunchIdFromCallEvent(callEvent);
+    const launchContext =
+      launchIdFromEvent ? await fetchOutboundLaunchContext(launchIdFromEvent) : null;
+    const callState = createCallState(callId, callEvent, launchContext);
+
+    if (launchIdFromEvent && !launchContext) {
+      console.warn(
+        `Launch context unavailable for ${launchIdFromEvent}; falling back to base prompt for call ${callId}.`
+      );
+    }
+
     activeCalls.set(callId, callState);
     await sendIngestCall(callState, 'start', { status: 'incoming' });
 
-    const acceptPayload = buildCallAcceptPayload(callEvent);
+    if (callState.launchId) {
+      await sendIngestOutbound('launch.openai_incoming', {
+        launch_id: callState.launchId,
+        openai_call_id: callId,
+        template_id: callState.templateId || null,
+        status: 'openai_incoming'
+      });
+    }
+
+    const acceptPayload = buildCallAcceptPayload(callEvent, {
+      launchContext: callState.launchContext
+    });
     const resp = await fetch(
       `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`,
       {
@@ -864,6 +1024,15 @@ async function acceptIncomingCall(callEvent) {
     if (!resp.ok) {
       callState.status = 'failed';
       await sendIngestCall(callState, 'status', { status: 'failed' });
+      if (callState.launchId) {
+        await sendIngestOutbound('launch.failed', {
+          launch_id: callState.launchId,
+          openai_call_id: callId,
+          status: 'failed',
+          error_code: 'openai_accept_failed',
+          error_message: `OpenAI accept failed with status ${resp.status}`
+        });
+      }
       activeCalls.delete(callId);
       const text = await resp.text().catch(() => '');
       throw new Error(`Failed to accept call ${callId}: ${resp.status} ${resp.statusText} ${text}`);
@@ -954,6 +1123,157 @@ app.post(
       remote_hangup_ok: hangupResult.ok,
       remote_status: hangupResult.status
     });
+  }
+);
+
+app.post(
+  '/control/outbound/launch',
+  controlJsonParser,
+  requireControlAuth,
+  async (req, res) => {
+    if (!twilioClient) {
+      return res.status(503).json({
+        ok: false,
+        error: {
+          code: 'twilio_not_configured',
+          message: 'Twilio credentials are missing. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.'
+        }
+      });
+    }
+
+    if (!TWILIO_OUTBOUND_FROM || !OPENAI_SIP_URI || !TWILIO_OUTBOUND_STATUS_CALLBACK_URL) {
+      return res.status(503).json({
+        ok: false,
+        error: {
+          code: 'outbound_not_configured',
+          message:
+            'Outbound launch is not configured. Set TWILIO_OUTBOUND_FROM, OPENAI_SIP_URI, and TWILIO_OUTBOUND_STATUS_CALLBACK_URL.'
+        }
+      });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const launchId = typeof body.launch_id === 'string' ? body.launch_id.trim() : '';
+    const to = normalizeE164(body.to || body.target_e164 || '');
+    if (!launchId) {
+      return res.status(400).json({
+        ok: false,
+        error: {
+          code: 'invalid_launch_id',
+          message: 'launch_id is required.'
+        }
+      });
+    }
+
+    if (!to) {
+      return res.status(400).json({
+        ok: false,
+        error: {
+          code: 'invalid_target',
+          message: 'to must be a valid E.164 number (e.g. +14155550123).'
+        }
+      });
+    }
+
+    await sendIngestOutbound('launch.requested', {
+      launch_id: launchId,
+      target_e164: to,
+      template_id: body.template_id || null,
+      objective_note: body.objective_note || null
+    });
+
+    const sipUri = buildSipUriWithLaunchId(OPENAI_SIP_URI, launchId);
+    if (!sipUri) {
+      return res.status(500).json({
+        ok: false,
+        error: {
+          code: 'invalid_sip_target',
+          message: 'Failed to build outbound SIP target URI.'
+        }
+      });
+    }
+
+    const twiml = buildOutboundTwiml(sipUri);
+    const separator = TWILIO_OUTBOUND_STATUS_CALLBACK_URL.includes('?') ? '&' : '?';
+    const statusCallbackUrl = `${TWILIO_OUTBOUND_STATUS_CALLBACK_URL}${separator}launch_id=${encodeURIComponent(launchId)}`;
+
+    try {
+      const call = await twilioClient.calls.create({
+        to,
+        from: TWILIO_OUTBOUND_FROM,
+        twiml,
+        statusCallback: statusCallbackUrl,
+        statusCallbackMethod: 'POST',
+        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed']
+      });
+
+      await sendIngestOutbound('launch.queued', {
+        launch_id: launchId,
+        target_e164: to,
+        template_id: body.template_id || null,
+        twilio_call_sid: call.sid,
+        twilio_status: call.status || 'queued'
+      });
+
+      return res.json({
+        ok: true,
+        launch_id: launchId,
+        twilio_call_sid: call.sid,
+        status: call.status || 'queued'
+      });
+    } catch (err) {
+      const errorCode = err?.code ? String(err.code) : 'twilio_create_failed';
+      const errorMessage = err?.message || 'Failed to create outbound Twilio call.';
+      await sendIngestOutbound('launch.failed', {
+        launch_id: launchId,
+        target_e164: to,
+        template_id: body.template_id || null,
+        error_code: errorCode,
+        error_message: errorMessage
+      });
+      return res.status(502).json({
+        ok: false,
+        launch_id: launchId,
+        error: {
+          code: errorCode,
+          message: errorMessage
+        }
+      });
+    }
+  }
+);
+
+app.post(
+  '/twilio/outbound/status',
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    const launchId = String(req.query.launch_id || req.body?.launch_id || '').trim();
+    if (!launchId) {
+      return res.sendStatus(200);
+    }
+
+    const callSid = req.body?.CallSid || null;
+    const callStatus = req.body?.CallStatus || req.body?.CallStatusCallbackEvent || '';
+    const event = mapTwilioCallStatusToOutboundEvent(callStatus) || 'launch.queued';
+    const timestampSeconds = Math.floor(Date.now() / 1000);
+    const payload = {
+      launch_id: launchId,
+      twilio_call_sid: callSid,
+      twilio_status: callStatus,
+      twilio_call_duration: req.body?.CallDuration || null,
+      twilio_error_code: req.body?.ErrorCode || null,
+      twilio_error_message: req.body?.ErrorMessage || null
+    };
+
+    if (event === 'launch.answered') {
+      payload.answered_at = timestampSeconds;
+    }
+    if (event === 'launch.completed' || event === 'launch.failed') {
+      payload.ended_at = timestampSeconds;
+    }
+
+    await sendIngestOutbound(event, payload);
+    return res.sendStatus(200);
   }
 );
 
