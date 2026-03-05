@@ -552,6 +552,7 @@ async function handleOutboundLaunchCreate(request, env) {
   }
 
   const objectiveNote = normalizeOptionalText(payload?.objective_note, 1200);
+  const calleeName = normalizeOptionalText(payload?.callee_name, 160);
   const launchId = createLaunchId();
 
   const launch = await createOutboundLaunch(env, {
@@ -559,8 +560,10 @@ async function handleOutboundLaunchCreate(request, env) {
     status: 'requested',
     template_id: template.template_id,
     target_e164: to,
+    callee_name: calleeName,
     objective_note: objectiveNote,
     instruction_block: template.instruction_block,
+    opening_script: template.opening_script,
     voice_override: template.voice_override,
     model_override: template.model_override,
     last_event_json: JSON.stringify({ event: 'launch.requested', ts: nowSeconds(), source: 'worker' })
@@ -570,8 +573,10 @@ async function handleOutboundLaunchCreate(request, env) {
     launch_id: launchId,
     to,
     template_id: template.template_id,
+    callee_name: calleeName,
     objective_note: objectiveNote,
     instruction_block: template.instruction_block,
+    opening_script: template.opening_script,
     voice_override: template.voice_override,
     model_override: template.model_override
   };
@@ -657,7 +662,9 @@ async function handleInternalLaunchContext(launchId, request, env) {
       status: context.launch.status,
       target_e164: context.launch.target_e164,
       template_id: context.launch.template_id,
+      callee_name: context.launch.callee_name,
       instruction_block: context.launch.instruction_block,
+      opening_script: context.launch.opening_script,
       objective_note: context.launch.objective_note,
       voice_override: context.launch.voice_override,
       model_override: context.launch.model_override,
@@ -712,6 +719,7 @@ async function handleTemplateCreate(request, env) {
       name,
       description: normalizeOptionalText(payload?.description, 500),
       instruction_block: instructionBlock,
+      opening_script: normalizeOptionalText(payload?.opening_script, 4000),
       voice_override: normalizeOptionalText(payload?.voice_override, 80),
       model_override: normalizeOptionalText(payload?.model_override, 120),
       is_active: payload?.is_active,
@@ -757,6 +765,9 @@ async function handleTemplateUpdate(templateId, request, env) {
 
   if (payload?.description !== undefined) {
     payload.description = normalizeOptionalText(payload?.description, 500);
+  }
+  if (payload?.opening_script !== undefined) {
+    payload.opening_script = normalizeOptionalText(payload?.opening_script, 4000);
   }
   if (payload?.voice_override !== undefined) {
     payload.voice_override = normalizeOptionalText(payload?.voice_override, 80);

@@ -71,6 +71,10 @@
                 <span>Template</span>
                 <select id="launchTemplateSelect"></select>
               </label>
+              <label class="control compact" for="launchCalleeNameInput">
+                <span>Callee Name (optional)</span>
+                <input id="launchCalleeNameInput" type="text" placeholder="Irene" />
+              </label>
             </div>
             <label class="control compact" for="launchObjectiveInput">
               <span>Objective Note</span>
@@ -120,6 +124,18 @@
                 <span>Instruction Block</span>
                 <textarea id="templateInstructionsInput" rows="5" placeholder="Template-specific instructions"></textarea>
               </label>
+              <label class="control compact" for="templateOpeningScriptInput">
+                <span>Opening Script</span>
+                <textarea
+                  id="templateOpeningScriptInput"
+                  rows="3"
+                  placeholder="Hi, is this {{callee_name}}?"
+                ></textarea>
+              </label>
+              <p class="muted compact-hint">
+                Placeholders: <code>{{callee_name}}</code>, <code>{{objective_note}}</code>,
+                <code>{{target_e164}}</code>
+              </p>
               <div class="template-flags">
                 <label class="toggle inline-toggle">
                   <input id="templateActiveInput" type="checkbox" checked />

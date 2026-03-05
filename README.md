@@ -28,7 +28,7 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
    - `OPENAI_MODEL`: Realtime-capable model (default `gpt-realtime`).
    - `OPENAI_VOICE`: Voice for synthesized speech (default `alloy`).
    - `PROMPT_PATH`: Path to the markdown file that defines your system instructions.
-   - `WELCOME_MESSAGE`: Optional greeting that is spoken as soon as the WebSocket comes up.
+   - `WELCOME_MESSAGE`: Optional inbound-only greeting spoken when the WebSocket comes up.
    - `PORT`: Local port for the Express server (default `3000`).
    - Optional transfer settings:
      - `HUMAN_AGENT_NUMBER`: PSTN destination in E.164 format (`+15551112222`). The server automatically converts it to `tel:+15551112222` for OpenAI SIP refer transfers.
@@ -69,12 +69,13 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
 
 - `/openai/webhook` verifies the `X-OpenAI-Signature`, accepts `realtime.call.incoming` events, and acknowledges other call lifecycle events with `200 OK`.
 - Accepting a call posts your prompt/voice/metadata via `/v1/realtime/calls/{call_id}/accept`, then connects to the Realtime Calls WebSocket (`wss://api.openai.com/v1/realtime?call_id=...`).
-- The WebSocket handler logs transcripts, greets the caller (if `WELCOME_MESSAGE` is set), and reacts to tool calls (warm transfer, CRM lookups, etc.). Caller and agent utterances are transcribed turn-by-turn; each completed sentence is sent to Discord (if `DISCORD_WEBHOOK_URL` is present) in the form `Caller: ...` / `Agent: ...`. If `HUMAN_AGENT_NUMBER` is present, the server registers a `transfer_to_human` tool that transfers the call using OpenAI SIP refer (`POST /v1/realtime/calls/{call_id}/refer`) to `tel:+...`.
+- The WebSocket handler logs transcripts and reacts to tool calls (warm transfer, CRM lookups, etc.). Inbound calls can receive an initial greeting if `WELCOME_MESSAGE` is set. Outbound calls instead receive a template-driven kickoff instruction so the first response can include both greeting and objective progression in one turn. Caller and agent utterances are transcribed turn-by-turn; each completed sentence is sent to Discord (if `DISCORD_WEBHOOK_URL` is present) in the form `Caller: ...` / `Agent: ...`. If `HUMAN_AGENT_NUMBER` is present, the server registers a `transfer_to_human` tool that transfers the call using OpenAI SIP refer (`POST /v1/realtime/calls/{call_id}/refer`) to `tel:+...`.
 - `GET /health` returns `{"status":"ok"}` for uptime checks.
 - Manual operator controls are available from:
   - `POST /control/calls/:call_id/transfer`
   - `POST /control/calls/:call_id/hangup`
-  - `POST /control/outbound/launch`
+- `POST /control/outbound/launch`
+  - Accepts optional `callee_name` and template snapshot fields (`instruction_block`, `opening_script`, overrides) forwarded by Worker.
   These endpoints operate on the server’s active in-memory call map. If `CONTROL_API_TOKEN` is set, pass `Authorization: Bearer <token>`.
 - Twilio launch status callback:
   - `POST /twilio/outbound/status`
@@ -95,9 +96,9 @@ If your dashboard calls the Cloudflare Worker API, configure these Worker secret
 
 The operator UI for this workflow is the static console in `cf-pages/`. It includes:
 - live calls + transcript view
-- outbound launch form
+- outbound launch form (`to`, `template`, optional `callee_name`, objective note)
 - recent launch status list
-- prompt template CRUD/default management
+- prompt template CRUD/default management (including optional `opening_script` placeholders like `{{callee_name}}`)
 
 Deploy `cf-pages` directly to Cloudflare Pages as a static directory (no build command required).
 

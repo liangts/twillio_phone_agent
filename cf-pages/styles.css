@@ -257,7 +257,8 @@ body {
 }
 
 #launchObjectiveInput,
-#templateInstructionsInput {
+#templateInstructionsInput,
+#templateOpeningScriptInput {
   resize: vertical;
 }
 
@@ -303,6 +304,11 @@ body {
 .template-form {
   display: grid;
   gap: 8px;
+}
+
+.compact-hint {
+  margin: -2px 0 0 0;
+  font-size: 12px;
 }
 
 .template-badges {

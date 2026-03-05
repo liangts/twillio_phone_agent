@@ -39,6 +39,7 @@ const elements = {
   toast: document.getElementById('toast'),
   launchToInput: document.getElementById('launchToInput'),
   launchTemplateSelect: document.getElementById('launchTemplateSelect'),
+  launchCalleeNameInput: document.getElementById('launchCalleeNameInput'),
   launchObjectiveInput: document.getElementById('launchObjectiveInput'),
   launchSubmitBtn: document.getElementById('launchSubmitBtn'),
   launchRequestStatus: document.getElementById('launchRequestStatus'),
@@ -49,6 +50,7 @@ const elements = {
   templateNameInput: document.getElementById('templateNameInput'),
   templateDescriptionInput: document.getElementById('templateDescriptionInput'),
   templateInstructionsInput: document.getElementById('templateInstructionsInput'),
+  templateOpeningScriptInput: document.getElementById('templateOpeningScriptInput'),
   templateVoiceInput: document.getElementById('templateVoiceInput'),
   templateModelInput: document.getElementById('templateModelInput'),
   templateActiveInput: document.getElementById('templateActiveInput'),
@@ -390,6 +392,10 @@ function renderLaunches() {
     template.className = 'meta-line';
     template.textContent = `Template ${launch.template_id || '-'}`;
 
+    const callee = document.createElement('div');
+    callee.className = 'meta-line';
+    callee.textContent = `Callee ${launch.callee_name || '-'}`;
+
     const updated = document.createElement('div');
     updated.className = 'meta-line';
     updated.textContent = `Updated ${formatDateTime(launch.updated_at)}`;
@@ -415,6 +421,7 @@ function renderLaunches() {
     card.appendChild(top);
     card.appendChild(target);
     card.appendChild(template);
+    card.appendChild(callee);
     card.appendChild(updated);
     if (actionRow.childNodes.length) {
       card.appendChild(actionRow);
@@ -554,6 +561,7 @@ function clearTemplateForm() {
   elements.templateNameInput.value = '';
   elements.templateDescriptionInput.value = '';
   elements.templateInstructionsInput.value = '';
+  elements.templateOpeningScriptInput.value = '';
   elements.templateVoiceInput.value = '';
   elements.templateModelInput.value = '';
   elements.templateActiveInput.checked = true;
@@ -568,6 +576,7 @@ function fillTemplateForm(template) {
   elements.templateNameInput.value = template.name || '';
   elements.templateDescriptionInput.value = template.description || '';
   elements.templateInstructionsInput.value = template.instruction_block || '';
+  elements.templateOpeningScriptInput.value = template.opening_script || '';
   elements.templateVoiceInput.value = template.voice_override || '';
   elements.templateModelInput.value = template.model_override || '';
   elements.templateActiveInput.checked = Number(template.is_active) === 1;
@@ -896,6 +905,7 @@ async function triggerOutboundLaunch() {
     const payload = {
       to,
       template_id: templateId,
+      callee_name: elements.launchCalleeNameInput.value.trim() || null,
       objective_note: elements.launchObjectiveInput.value.trim() || null
     };
 
@@ -909,6 +919,7 @@ async function triggerOutboundLaunch() {
     setLaunchStatus('Queued', 'success');
     showToast(`Launch ${launchId} queued.`, 'success');
 
+    elements.launchCalleeNameInput.value = '';
     elements.launchObjectiveInput.value = '';
     await loadLaunches({ reset: true });
     await loadCalls({ reset: true });
@@ -941,6 +952,7 @@ function collectTemplatePayload() {
     name,
     description: elements.templateDescriptionInput.value.trim() || null,
     instruction_block: instructionBlock,
+    opening_script: elements.templateOpeningScriptInput.value.trim() || null,
     voice_override: elements.templateVoiceInput.value.trim() || null,
     model_override: elements.templateModelInput.value.trim() || null,
     is_active: elements.templateActiveInput.checked,

@@ -333,17 +333,86 @@ function loadPrompt() {
   }
 }
 
+function normalizeInstructionText(value) {
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+}
+
+function renderLaunchScript(template, variables = {}) {
+  const source = normalizeInstructionText(template);
+  if (!source) return '';
+  const rendered = source.replace(/\{\{\s*([a-z0-9_]+)\s*\}\}/gi, (_match, key) => {
+    const value = variables[String(key).toLowerCase()];
+    if (value === undefined || value === null) return '';
+    return String(value);
+  });
+  return rendered.replace(/\s+/g, ' ').trim();
+}
+
+function buildOutboundInstructions(launchContext = {}) {
+  const instructionParts = [];
+  const templateInstructions = normalizeInstructionText(launchContext.instruction_block);
+  const openingScript = normalizeInstructionText(launchContext.opening_script);
+  const calleeName = normalizeInstructionText(launchContext.callee_name);
+  const targetNumber = normalizeInstructionText(launchContext.target_e164);
+  const objectiveNote = normalizeInstructionText(launchContext.objective_note);
+
+  if (templateInstructions) {
+    instructionParts.push(templateInstructions);
+  } else {
+    instructionParts.push(
+      'You are an outbound AI phone agent. Start naturally and continue to the first objective step in the same turn.'
+    );
+  }
+
+  if (openingScript) {
+    instructionParts.push(`Opening Script Template:\n${openingScript}`);
+  }
+  if (calleeName) {
+    instructionParts.push(`Callee Name:\n${calleeName}`);
+  }
+  if (targetNumber) {
+    instructionParts.push(`Target Number:\n${targetNumber}`);
+  }
+  if (objectiveNote) {
+    instructionParts.push(`Objective:\n${objectiveNote}`);
+  }
+
+  return instructionParts.filter(Boolean).join('\n\n');
+}
+
+function buildOutboundKickoffInstructions(call) {
+  if (!call?.launchId) return null;
+  const launchContext = call.launchContext || {};
+  const calleeName = normalizeInstructionText(launchContext.callee_name);
+  const objectiveNote = normalizeInstructionText(launchContext.objective_note);
+  const targetNumber = normalizeInstructionText(launchContext.target_e164 || call.to);
+  const openingLine = renderLaunchScript(launchContext.opening_script, {
+    callee_name: calleeName,
+    objective_note: objectiveNote,
+    target_e164: targetNumber
+  });
+
+  const lines = ['Start speaking now.'];
+  if (openingLine) {
+    lines.push(`Say this opening line first: "${openingLine}".`);
+  } else if (calleeName) {
+    lines.push(`Start by confirming identity naturally, for example: "Hi, is this ${calleeName}?"`);
+  } else {
+    lines.push('Start with a concise greeting.');
+  }
+  lines.push('In the same response, continue into the first objective question or next required step.');
+  lines.push('Do not stop after only a greeting unless identity confirmation is explicitly required.');
+  if (objectiveNote) {
+    lines.push(`Objective context: ${objectiveNote}`);
+  }
+  return lines.join('\n');
+}
+
 function buildCallAcceptPayload(callEvent, options = {}) {
   const launchContext = options.launchContext || null;
-  const baseInstructions = loadPrompt();
-  const instructionParts = [baseInstructions];
-  if (launchContext?.instruction_block) {
-    instructionParts.push(String(launchContext.instruction_block).trim());
-  }
-  if (launchContext?.objective_note) {
-    instructionParts.push(`Objective:\n${String(launchContext.objective_note).trim()}`);
-  }
-  const instructions = instructionParts.filter(Boolean).join('\n\n');
+  const isOutbound = Boolean(launchContext?.launch_id || launchContext?.template_id);
+  const instructions = isOutbound ? buildOutboundInstructions(launchContext) : loadPrompt();
   const tools = getToolDefinitions();
   const transcription =
     INPUT_TRANSCRIPTION_MODEL
@@ -440,6 +509,7 @@ function createCallState(callId, callEvent, launchContext = null) {
   const conferenceName = extractConferenceName(callEvent);
   const launchId = launchContext?.launch_id || rawLaunchIdHeader || callEvent?.data?.launch_id || null;
   const templateId = launchContext?.template_id || null;
+  const calleeName = launchContext?.callee_name || null;
   const direction = launchId ? 'outbound' : 'inbound';
 
   return {
@@ -451,6 +521,7 @@ function createCallState(callId, callEvent, launchContext = null) {
     provider: callEvent?.data?.provider || (callEvent?.data?.twilio ? 'twilio' : null),
     launchId,
     templateId,
+    calleeName,
     direction,
     launchContext,
     ws: null,
@@ -713,6 +784,10 @@ function announceIncomingCall(call) {
     lines.push(`Template: ${call.templateId}`);
   }
 
+  if (call.calleeName) {
+    lines.push(`Callee: ${call.calleeName}`);
+  }
+
   if (call.conferenceName) {
     lines.push(`Conference: ${call.conferenceName}`);
   }
@@ -944,14 +1019,13 @@ function connectRealtimeSocket(call, wsUrl) {
           status: 'openai_live'
         }).catch(() => {});
       }
-      if (WELCOME_MESSAGE) {
-        const message = {
-          type: 'response.create',
-          response: {
-            instructions: WELCOME_MESSAGE
-          }
-        };
-        ws.send(JSON.stringify(message));
+      if (call.direction === 'outbound') {
+        const kickoff = buildOutboundKickoffInstructions(call);
+        if (kickoff) {
+          sendSystemResponse(call, kickoff);
+        }
+      } else if (WELCOME_MESSAGE) {
+        sendSystemResponse(call, WELCOME_MESSAGE);
       }
     });
 
@@ -1179,6 +1253,7 @@ app.post(
       launch_id: launchId,
       target_e164: to,
       template_id: body.template_id || null,
+      callee_name: body.callee_name || null,
       objective_note: body.objective_note || null
     });
 
@@ -1211,6 +1286,7 @@ app.post(
         launch_id: launchId,
         target_e164: to,
         template_id: body.template_id || null,
+        callee_name: body.callee_name || null,
         twilio_call_sid: call.sid,
         twilio_status: call.status || 'queued'
       });
