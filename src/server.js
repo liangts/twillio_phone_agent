@@ -9,6 +9,55 @@ const fetch = require('node-fetch');
 
 dotenv.config();
 
+function parseBooleanEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') {
+    return fallback;
+  }
+
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === 'true') return true;
+  if (normalized === 'false') return false;
+  return fallback;
+}
+
+function parseNumberEnv(name, fallback, options = {}) {
+  const { min = Number.NEGATIVE_INFINITY, max = Number.POSITIVE_INFINITY, clamp = false } = options;
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') {
+    return fallback;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  let value = parsed;
+  if (value < min) {
+    value = clamp ? min : fallback;
+  }
+  if (value > max) {
+    value = clamp ? max : fallback;
+  }
+  return value;
+}
+
+function parseIntegerEnv(name, fallback, options = {}) {
+  const parsed = parseNumberEnv(name, fallback, options);
+  return Number.isFinite(parsed) ? Math.round(parsed) : fallback;
+}
+
+function parseNoiseReductionType(value, fallback = 'near_field') {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  if (normalized === 'near_field' || normalized === 'far_field') {
+    return normalized;
+  }
+  return fallback;
+}
+
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_WEBHOOK_SECRET = process.env.OPENAI_WEBHOOK_SECRET;
@@ -27,6 +76,33 @@ const TWILIO_OUTBOUND_STATUS_CALLBACK_URL = process.env.TWILIO_OUTBOUND_STATUS_C
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 const INPUT_TRANSCRIPTION_MODEL = process.env.INPUT_TRANSCRIPTION_MODEL || 'gpt-4o-mini-transcribe';
 const INPUT_TRANSCRIPTION_LANGUAGE = process.env.INPUT_TRANSCRIPTION_LANGUAGE || '';
+const OPENAI_INPUT_NOISE_REDUCTION = parseNoiseReductionType(
+  process.env.OPENAI_INPUT_NOISE_REDUCTION,
+  'near_field'
+);
+const OPENAI_TURN_DETECTION_THRESHOLD = parseNumberEnv(
+  'OPENAI_TURN_DETECTION_THRESHOLD',
+  0.7,
+  { min: 0, max: 1, clamp: true }
+);
+const OPENAI_TURN_DETECTION_PREFIX_PADDING_MS = parseIntegerEnv(
+  'OPENAI_TURN_DETECTION_PREFIX_PADDING_MS',
+  300,
+  { min: 0 }
+);
+const OPENAI_TURN_DETECTION_SILENCE_DURATION_MS = parseIntegerEnv(
+  'OPENAI_TURN_DETECTION_SILENCE_DURATION_MS',
+  700,
+  { min: 0 }
+);
+const OPENAI_TURN_DETECTION_INTERRUPT_RESPONSE = parseBooleanEnv(
+  'OPENAI_TURN_DETECTION_INTERRUPT_RESPONSE',
+  true
+);
+const OPENAI_TURN_DETECTION_CREATE_RESPONSE = parseBooleanEnv(
+  'OPENAI_TURN_DETECTION_CREATE_RESPONSE',
+  true
+);
 const CF_INGEST_BASE_URL = process.env.CF_INGEST_BASE_URL || '';
 const CF_INGEST_TOKEN = process.env.CF_INGEST_TOKEN || '';
 const CONTROL_API_TOKEN = process.env.CONTROL_API_TOKEN || '';
@@ -333,6 +409,39 @@ function loadPrompt() {
   }
 }
 
+function buildRealtimeAudioInputConfig(transcription = null) {
+  const inputConfig = {
+    noise_reduction: {
+      type: OPENAI_INPUT_NOISE_REDUCTION
+    },
+    turn_detection: {
+      type: 'server_vad',
+      threshold: OPENAI_TURN_DETECTION_THRESHOLD,
+      prefix_padding_ms: OPENAI_TURN_DETECTION_PREFIX_PADDING_MS,
+      silence_duration_ms: OPENAI_TURN_DETECTION_SILENCE_DURATION_MS,
+      create_response: OPENAI_TURN_DETECTION_CREATE_RESPONSE,
+      interrupt_response: OPENAI_TURN_DETECTION_INTERRUPT_RESPONSE
+    }
+  };
+
+  if (transcription) {
+    inputConfig.transcription = transcription;
+  }
+
+  return inputConfig;
+}
+
+function formatRealtimeAudioProfile() {
+  return [
+    `noise_reduction=${OPENAI_INPUT_NOISE_REDUCTION}`,
+    `threshold=${OPENAI_TURN_DETECTION_THRESHOLD}`,
+    `prefix_padding_ms=${OPENAI_TURN_DETECTION_PREFIX_PADDING_MS}`,
+    `silence_duration_ms=${OPENAI_TURN_DETECTION_SILENCE_DURATION_MS}`,
+    `interrupt_response=${OPENAI_TURN_DETECTION_INTERRUPT_RESPONSE}`,
+    `create_response=${OPENAI_TURN_DETECTION_CREATE_RESPONSE}`
+  ].join(', ');
+}
+
 function normalizeInstructionText(value) {
   if (value === undefined || value === null) return '';
   return String(value).trim();
@@ -423,16 +532,11 @@ function buildCallAcceptPayload(callEvent, options = {}) {
       : null;
 
   const audioConfig = {
+    input: buildRealtimeAudioInputConfig(transcription),
     output: {
       voice: launchContext?.voice_override || OPENAI_VOICE
     }
   };
-
-  if (transcription) {
-    audioConfig.input = {
-      transcription
-    };
-  }
 
   return {
     type: 'realtime',
@@ -1083,6 +1187,7 @@ async function acceptIncomingCall(callEvent) {
     const acceptPayload = buildCallAcceptPayload(callEvent, {
       launchContext: callState.launchContext
     });
+    console.log(`Accepting call ${callId} with audio profile: ${formatRealtimeAudioProfile()}`);
     const resp = await fetch(
       `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`,
       {

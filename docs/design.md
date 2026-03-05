@@ -37,6 +37,7 @@
 - `buildCallAcceptPayload(event)`:
   - Sets model/voice, `output_modalities`/audio output.
   - Adds input transcription via `audio.input.transcription` (model + optional language).
+  - Applies caller-audio noise reduction plus `server_vad` turn detection tuning (`threshold`, `prefix_padding_ms`, `silence_duration_ms`, `interrupt_response`, `create_response`) to reduce false interruptions from light noise.
   - Attaches tool definitions when available.
 - `acceptIncomingCall(event)`:
   - Creates call state, POSTs `/accept`, announces caller info to Discord, then opens the realtime WebSocket.
@@ -74,4 +75,3 @@
 - Add final transcript dump on call end (interleaving `transcriptLog` by timestamp).
 - Backpressure/retry for Discord/Twilio calls (with timeouts).
 - Optional metrics (latency from webhook to `/accept`, socket uptime, transcript counts).
-

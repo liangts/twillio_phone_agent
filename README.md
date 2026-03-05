@@ -44,6 +44,13 @@ OpenAI terminates the RTP/audio path. Our code only needs to:
    - Optional transcription tuning:
       - `INPUT_TRANSCRIPTION_MODEL`: Speech-to-text model for caller audio (default `gpt-4o-mini-transcribe`).
       - `INPUT_TRANSCRIPTION_LANGUAGE`: Force transcription language (leave blank for auto).
+   - Optional Realtime caller-audio tuning:
+      - `OPENAI_INPUT_NOISE_REDUCTION`: Noise reduction profile for caller audio (`near_field` default, `far_field` for speakerphone/room audio).
+      - `OPENAI_TURN_DETECTION_THRESHOLD`: Server VAD sensitivity from `0.0` to `1.0` (default `0.70`).
+      - `OPENAI_TURN_DETECTION_PREFIX_PADDING_MS`: Audio preserved immediately before detected caller speech (default `300`).
+      - `OPENAI_TURN_DETECTION_SILENCE_DURATION_MS`: Silence window before a caller turn is considered complete (default `700`).
+      - `OPENAI_TURN_DETECTION_INTERRUPT_RESPONSE`: Whether detected caller speech interrupts assistant audio output (default `true`).
+      - `OPENAI_TURN_DETECTION_CREATE_RESPONSE`: Whether the server automatically creates a response after caller speech ends (default `true`).
 4. **Start the server**
    ```bash
    npm start
