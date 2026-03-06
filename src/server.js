@@ -510,8 +510,12 @@ function buildOutboundKickoffInstructions(call) {
   } else {
     lines.push('Start with a concise greeting.');
   }
+  lines.push('Immediately after the greeting or identity check, say that you are calling on the user\'s behalf.');
   lines.push('In the same response, continue into the first objective question or next required step.');
   lines.push('Do not stop after only a greeting unless identity confirmation is explicitly required.');
+  lines.push('When you describe the objective to the callee, phrase it from your side on the user\'s behalf.');
+  lines.push('Do not describe the objective as if it came from the callee.');
+  lines.push('For example, do not say "you want to reserve" to the callee. Say "I would like to reserve on Liang Tianshu\'s behalf" or equivalent wording that matches the template and language.');
   if (objectiveNote) {
     lines.push(`Objective context: ${objectiveNote}`);
   }
